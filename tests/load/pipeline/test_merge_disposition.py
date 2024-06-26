@@ -11,7 +11,7 @@ from dlt.common import json, pendulum
 from dlt.common.configuration.container import Container
 from dlt.common.pipeline import StateInjectableContext
 from dlt.common.schema.utils import has_table_seen_data
-from dlt.common.schema.exceptions import SchemaException
+from dlt.common.schema.exceptions import SchemaException, UnboundColumnException
 from dlt.common.typing import StrAny
 from dlt.common.utils import digest128
 from dlt.extract import DltResource
@@ -996,3 +996,24 @@ def test_invalid_merge_strategy(destination_config: DestinationTestConfiguration
     with pytest.raises(PipelineStepFailed) as pip_ex:
         p.run(r())
     assert isinstance(pip_ex.value.__context__, SchemaException)
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["duckdb"]),
+    ids=lambda x: x.name,
+)
+def test_missing_merge_key_column(destination_config: DestinationTestConfiguration) -> None:
+    """Merge key is not present in data, error is raised"""
+
+    @dlt.resource(merge_key="not_a_column", write_disposition={"disposition": "merge"})
+    def r():
+        yield {"foo": "bar"}
+
+    p = destination_config.setup_pipeline("abstract", full_refresh=True)
+    with pytest.raises(PipelineStepFailed) as pip_ex:
+        p.run(r())
+
+    ex = pip_ex.value
+    assert ex.step == 'normalize'
+    assert isinstance(ex.__context__, UnboundColumnException)
