@@ -41,7 +41,7 @@ user's profile Stateless data cannot change - for example, a recorded event, suc
 
 Because stateless data does not need to be updated, we can just append it.
 
-For stateful data, comes a second question - Can I extract it incrementally from the source? If yes, you should use [slowly changing dimensions (Type-2)](#scd2-strategy), which allow you to maintain historical records of data changes over time. 
+For stateful data, comes a second question - Can I extract it incrementally from the source? If yes, you should use [slowly changing dimensions (Type-2)](#scd2-strategy), which allow you to maintain historical records of data changes over time.
 
 If not, then we need to replace the entire data set. If however we can request the data incrementally such
 as "all users added or modified since yesterday" then we can simply apply changes to our existing
@@ -657,7 +657,7 @@ than `end_value`.
 
 :::caution
 In rare cases when you use Incremental with a transformer, `dlt` will not be able to automatically close
-generator associated with a row that is out of range. You can still use still call `can_close()` method on
+generator associated with a row that is out of range. You can still call the `can_close()` method on
 incremental and exit yield loop when true.
 :::
 
