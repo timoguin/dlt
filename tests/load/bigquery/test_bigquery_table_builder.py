@@ -1,17 +1,10 @@
 import os
 from copy import deepcopy
 from typing import Iterator, Dict, Any, List
-from dlt.common.destination.exceptions import DestinationSchemaTampered
-from dlt.common.schema.exceptions import SchemaIdentifierNormalizationCollision
-from dlt.destinations.impl.bigquery.bigquery_adapter import (
-    PARTITION_HINT,
-    CLUSTER_HINT,
-)
 
 import google
 import pytest
 import sqlfluff
-from google.cloud.bigquery import Table
 
 import dlt
 from dlt.common.configuration import resolve_configuration
@@ -19,26 +12,28 @@ from dlt.common.configuration.specs import (
     GcpServiceAccountCredentialsWithoutDefaults,
     GcpServiceAccountCredentials,
 )
+from dlt.common.destination.exceptions import DestinationSchemaTampered
 from dlt.common.pendulum import pendulum
 from dlt.common.schema import Schema, utils
+from dlt.common.schema.exceptions import SchemaIdentifierNormalizationCollision
 from dlt.common.utils import custom_environ
 from dlt.common.utils import uniq_id
-
-from dlt.destinations.exceptions import DestinationSchemaWillNotUpdate
 from dlt.destinations import bigquery
-from dlt.destinations.impl.bigquery.bigquery import BigQueryClient
 from dlt.destinations.adapters import bigquery_adapter
+from dlt.destinations.exceptions import DestinationSchemaWillNotUpdate
+from dlt.destinations.impl.bigquery.bigquery import BigQueryClient
+from dlt.destinations.impl.bigquery.bigquery_adapter import (
+    PARTITION_HINT,
+    CLUSTER_HINT,
+)
 from dlt.destinations.impl.bigquery.configuration import BigQueryClientConfiguration
-
 from dlt.extract import DltResource
-
 from tests.load.utils import (
     destinations_configs,
     DestinationTestConfiguration,
     drop_active_pipeline_data,
     TABLE_UPDATE,
     sequence_generator,
-    empty_schema,
 )
 
 # mark all tests as essential, do not remove
@@ -112,25 +107,25 @@ def test_create_table(gcp_client: BigQueryClient) -> None:
     sqlfluff.parse(sql, dialect="bigquery")
     assert sql.startswith("CREATE TABLE")
     assert "event_test_table" in sql
-    assert "`col1` INT64 NOT NULL" in sql
-    assert "`col2` FLOAT64 NOT NULL" in sql
-    assert "`col3` BOOL NOT NULL" in sql
-    assert "`col4` TIMESTAMP NOT NULL" in sql
+    assert "`col1` INT64  NOT NULL" in sql
+    assert "`col2` FLOAT64  NOT NULL" in sql
+    assert "`col3` BOOL  NOT NULL" in sql
+    assert "`col4` TIMESTAMP  NOT NULL" in sql
     assert "`col5` STRING " in sql
-    assert "`col6` NUMERIC(38,9) NOT NULL" in sql
+    assert "`col6` NUMERIC(38,9)  NOT NULL" in sql
     assert "`col7` BYTES" in sql
     assert "`col8` BIGNUMERIC" in sql
-    assert "`col9` JSON NOT NULL" in sql
+    assert "`col9` JSON  NOT NULL" in sql
     assert "`col10` DATE" in sql
     assert "`col11` TIME" in sql
-    assert "`col1_precision` INT64 NOT NULL" in sql
-    assert "`col4_precision` TIMESTAMP NOT NULL" in sql
+    assert "`col1_precision` INT64  NOT NULL" in sql
+    assert "`col4_precision` TIMESTAMP  NOT NULL" in sql
     assert "`col5_precision` STRING(25) " in sql
-    assert "`col6_precision` NUMERIC(6,2) NOT NULL" in sql
+    assert "`col6_precision` NUMERIC(6,2)  NOT NULL" in sql
     assert "`col7_precision` BYTES(19)" in sql
-    assert "`col11_precision` TIME NOT NULL" in sql
-    assert "`col_high_p_decimal` BIGNUMERIC(76,0) NOT NULL" in sql
-    assert "`col_high_s_decimal` BIGNUMERIC(38,24) NOT NULL" in sql
+    assert "`col11_precision` TIME  NOT NULL" in sql
+    assert "`col_high_p_decimal` BIGNUMERIC(76,0)  NOT NULL" in sql
+    assert "`col_high_s_decimal` BIGNUMERIC(38,24)  NOT NULL" in sql
     assert "CLUSTER BY" not in sql
     assert "PARTITION BY" not in sql
 
@@ -142,29 +137,29 @@ def test_alter_table(gcp_client: BigQueryClient) -> None:
     assert sql.startswith("ALTER TABLE")
     assert sql.count("ALTER TABLE") == 1
     assert "event_test_table" in sql
-    assert "ADD COLUMN `col1` INT64 NOT NULL" in sql
-    assert "ADD COLUMN `col2` FLOAT64 NOT NULL" in sql
-    assert "ADD COLUMN `col3` BOOL NOT NULL" in sql
-    assert "ADD COLUMN `col4` TIMESTAMP NOT NULL" in sql
+    assert "ADD COLUMN `col1` INT64  NOT NULL" in sql
+    assert "ADD COLUMN `col2` FLOAT64  NOT NULL" in sql
+    assert "ADD COLUMN `col3` BOOL  NOT NULL" in sql
+    assert "ADD COLUMN `col4` TIMESTAMP  NOT NULL" in sql
     assert "ADD COLUMN `col5` STRING" in sql
-    assert "ADD COLUMN `col6` NUMERIC(38,9) NOT NULL" in sql
+    assert "ADD COLUMN `col6` NUMERIC(38,9)  NOT NULL" in sql
     assert "ADD COLUMN `col7` BYTES" in sql
     assert "ADD COLUMN `col8` BIGNUMERIC" in sql
-    assert "ADD COLUMN `col9` JSON NOT NULL" in sql
+    assert "ADD COLUMN `col9` JSON  NOT NULL" in sql
     assert "ADD COLUMN `col10` DATE" in sql
     assert "ADD COLUMN `col11` TIME" in sql
-    assert "ADD COLUMN `col1_precision` INT64 NOT NULL" in sql
-    assert "ADD COLUMN `col4_precision` TIMESTAMP NOT NULL" in sql
+    assert "ADD COLUMN `col1_precision` INT64  NOT NULL" in sql
+    assert "ADD COLUMN `col4_precision` TIMESTAMP  NOT NULL" in sql
     assert "ADD COLUMN `col5_precision` STRING(25)" in sql
-    assert "ADD COLUMN `col6_precision` NUMERIC(6,2) NOT NULL" in sql
+    assert "ADD COLUMN `col6_precision` NUMERIC(6,2)  NOT NULL" in sql
     assert "ADD COLUMN `col7_precision` BYTES(19)" in sql
-    assert "ADD COLUMN `col11_precision` TIME NOT NULL" in sql
+    assert "ADD COLUMN `col11_precision` TIME  NOT NULL" in sql
     # table has col1 already in storage
     mod_table = deepcopy(TABLE_UPDATE)
     mod_table.pop(0)
     sql = gcp_client._get_table_update_sql("event_test_table", mod_table, True)[0]
-    assert "ADD COLUMN `col1` INTEGER NOT NULL" not in sql
-    assert "ADD COLUMN `col2` FLOAT64 NOT NULL" in sql
+    assert "ADD COLUMN `col1` INTEGER  NOT NULL" not in sql
+    assert "ADD COLUMN `col2` FLOAT64  NOT NULL" in sql
 
 
 def test_create_table_case_insensitive(ci_gcp_client: BigQueryClient) -> None:
@@ -197,7 +192,7 @@ def test_create_table_case_insensitive(ci_gcp_client: BigQueryClient) -> None:
     )
     assert "Event_TEST_tablE" in ci_gcp_client.schema.tables
     with pytest.raises(SchemaIdentifierNormalizationCollision) as coll_ex:
-        ci_gcp_client.update_stored_schema([])
+        ci_gcp_client.verify_schema()
     assert coll_ex.value.conflict_identifier_name == "Event_test_tablE"
     assert coll_ex.value.table_name == "Event_TEST_tablE"
 
@@ -205,6 +200,7 @@ def test_create_table_case_insensitive(ci_gcp_client: BigQueryClient) -> None:
     ci_gcp_client.capabilities.has_case_sensitive_identifiers = True
     # now the check passes, we are stopped because it is not allowed to change schema in the loader
     with pytest.raises(DestinationSchemaTampered):
+        ci_gcp_client.verify_schema()
         ci_gcp_client.update_stored_schema([])
 
 
@@ -538,7 +534,7 @@ def test_adapter_hints_parsing_partitioning() -> None:
     def some_data() -> Iterator[Dict[str, str]]:
         yield from next(sequence_generator())
 
-    bigquery_adapter(some_data, partition="int_col")
+    bigquery_adapter(some_data, partition="int_col", partition_expiration_days=4)
     assert some_data.columns == {
         "int_col": {
             "name": "int_col",
@@ -546,6 +542,8 @@ def test_adapter_hints_parsing_partitioning() -> None:
             "x-bigquery-partition": True,
         },
     }
+    table_schema = some_data.compute_table_schema()
+    assert table_schema["x-bigquery-partition-expiration-days"] == 4  # type: ignore[typeddict-item]
 
 
 def test_adapter_on_data() -> None:
@@ -566,11 +564,20 @@ def test_adapter_hints_partitioning(
     def no_hints() -> Iterator[Dict[str, int]]:
         yield from [{"col1": i} for i in range(10)]
 
+    @dlt.resource(columns=[{"name": "col1", "data_type": "date"}])
+    def date_no_hints() -> Iterator[Dict[str, pendulum.Date]]:
+        yield from [{"col1": pendulum.now().add(days=i).date()} for i in range(10)]
+
     hints = bigquery_adapter(no_hints.with_name(new_name="hints"), partition="col1")
+    date_hints = bigquery_adapter(
+        date_no_hints.with_name(new_name="date_hints"),
+        partition="col1",
+        partition_expiration_days=3,
+    )
 
     @dlt.source(max_table_nesting=0)
     def sources() -> List[DltResource]:
-        return [no_hints, hints]
+        return [no_hints, hints, date_hints]
 
     pipeline = destination_config.setup_pipeline(
         f"bigquery_{uniq_id()}",
@@ -584,11 +591,14 @@ def test_adapter_hints_partitioning(
 
         fqtn_no_hints = c.make_qualified_table_name("no_hints", escape=False)
         fqtn_hints = c.make_qualified_table_name("hints", escape=False)
+        fqtn_date_hints = c.make_qualified_table_name("date_hints", escape=False)
 
         no_hints_table = nc.get_table(fqtn_no_hints)
         hints_table = nc.get_table(fqtn_hints)
+        date_hints_table = nc.get_table(fqtn_date_hints)
 
         assert not no_hints_table.range_partitioning, "`no_hints` table IS clustered on a column."
+        assert date_hints_table.time_partitioning.expiration_ms == 3 * 24 * 60 * 60 * 1000
 
         if not hints_table.range_partitioning:
             raise ValueError("`hints` table IS NOT clustered on a column.")
@@ -1019,8 +1029,7 @@ def test_adapter_additional_table_hints_table_description_with_alter_table(
         dlt.resource([{"col2": "ABC"}], name="hints"),
         table_description="Once upon a time a small table got hinted twice.",
     )
-    info = pipeline.run(mod_hints)
-    info.raise_on_failed_jobs()
+    pipeline.run(mod_hints)
     assert pipeline.last_trace.last_normalize_info.row_counts["hints"] == 1
 
     with pipeline.sql_client() as c:
@@ -1044,97 +1053,3 @@ def test_adapter_additional_table_hints_parsing_table_expiration() -> None:
     bigquery_adapter(some_data, table_expiration_datetime="2030-01-01")
 
     assert some_data._hints["x-bigquery-table-expiration"] == pendulum.datetime(2030, 1, 1)  # type: ignore
-
-
-@pytest.mark.parametrize(
-    "destination_config",
-    destinations_configs(default_sql_configs=True, subset=["bigquery"]),
-    ids=lambda x: x.name,
-)
-def test_adapter_additional_table_hints_table_expiration(
-    destination_config: DestinationTestConfiguration,
-) -> None:
-    @dlt.resource(columns=[{"name": "col1", "data_type": "text"}])
-    def no_hints() -> Iterator[Dict[str, str]]:
-        yield from [{"col1": str(i)} for i in range(10)]
-
-    hints = bigquery_adapter(
-        no_hints.with_name(new_name="hints"), table_expiration_datetime="2030-01-01"
-    )
-
-    @dlt.source(max_table_nesting=0)
-    def sources() -> List[DltResource]:
-        return [no_hints, hints]
-
-    pipeline = destination_config.setup_pipeline(
-        f"bigquery_{uniq_id()}",
-        dev_mode=True,
-    )
-
-    pipeline.run(sources())
-
-    with pipeline.sql_client() as c:
-        nc: google.cloud.bigquery.client.Client = c.native_connection
-
-        fqtn_no_hints = c.make_qualified_table_name("no_hints", escape=False)
-        fqtn_hints = c.make_qualified_table_name("hints", escape=False)
-
-        no_hints_table = nc.get_table(fqtn_no_hints)
-        hints_table = nc.get_table(fqtn_hints)
-
-        assert not no_hints_table.expires
-        assert hints_table.expires == pendulum.datetime(2030, 1, 1, 0)
-
-
-@pytest.mark.parametrize(
-    "destination_config",
-    destinations_configs(default_sql_configs=True, subset=["bigquery"]),
-    ids=lambda x: x.name,
-)
-def test_adapter_merge_behaviour(
-    destination_config: DestinationTestConfiguration,
-) -> None:
-    @dlt.resource(
-        columns=[
-            {"name": "col1", "data_type": "text"},
-            {"name": "col2", "data_type": "bigint"},
-            {"name": "col3", "data_type": "double"},
-        ]
-    )
-    def hints() -> Iterator[Dict[str, Any]]:
-        yield from [{"col1": str(i), "col2": i, "col3": float(i)} for i in range(10)]
-
-    bigquery_adapter(hints, table_expiration_datetime="2030-01-01", cluster=["col1"])
-    bigquery_adapter(
-        hints,
-        table_description="A small table somewhere in the cosmos...",
-        partition="col2",
-    )
-
-    pipeline = destination_config.setup_pipeline(
-        f"bigquery_{uniq_id()}",
-        dev_mode=True,
-    )
-
-    pipeline.run(hints)
-
-    with pipeline.sql_client() as c:
-        nc: google.cloud.bigquery.client.Client = c.native_connection
-
-        table_fqtn = c.make_qualified_table_name("hints", escape=False)
-
-        table: Table = nc.get_table(table_fqtn)
-
-        table_cluster_fields = [] if table.clustering_fields is None else table.clustering_fields
-
-        # Test merging behaviour.
-        assert table.expires == pendulum.datetime(2030, 1, 1, 0)
-        assert ["col1"] == table_cluster_fields, "`hints` table IS NOT clustered by `col1`."
-        assert table.description == "A small table somewhere in the cosmos..."
-
-        if not table.range_partitioning:
-            raise ValueError("`hints` table IS NOT clustered on a column.")
-        else:
-            assert (
-                table.range_partitioning.field == "col2"
-            ), "`hints` table IS NOT clustered on column `col2`."

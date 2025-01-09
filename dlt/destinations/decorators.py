@@ -50,12 +50,12 @@ def destination(
     Here all incoming data will be sent to the destination function with the items in the requested format and the dlt table schema.
     The config and secret values will be resolved from the path destination.my_destination.api_url and destination.my_destination.api_secret.
 
-    #### Args:
+    Args:
         batch_size: defines how many items per function call are batched together and sent as an array. If you set a batch-size of 0, instead of passing in actual dataitems, you will receive one call per load job with the path of the file as the items argument. You can then open and process that file in any way you like.
         loader_file_format: defines in which format files are stored in the load package before being sent to the destination function, this can be puae-jsonl or parquet.
         name: defines the name of the destination that get's created by the destination decorator, defaults to the name of the function
         naming_convention: defines the name of the destination that gets created by the destination decorator. This controls how table and column names are normalized. The default is direct which will keep all names the same.
-        max_nesting_level: defines how deep the normalizer will go to normalize complex fields on your data to create subtables. This overwrites any settings on your source and is set to zero to not create any nested tables by default.
+        max_nesting_level: defines how deep the normalizer will go to normalize nested fields on your data to create subtables. This overwrites any settings on your source and is set to zero to not create any nested tables by default.
         skip_dlt_columns_and_tables: defines wether internal tables and columns will be fed into the custom destination function. This is set to True by default.
         spec: defines a configuration spec that will be used to to inject arguments into the decorated functions. Argument not in spec will not be injected
         max_parallel_load_jobs: how many load jobs at most will be running during the load

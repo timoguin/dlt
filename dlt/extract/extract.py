@@ -2,7 +2,7 @@ import contextlib
 from collections.abc import Sequence as C_Sequence
 from copy import copy
 import itertools
-from typing import Iterator, List, Dict, Any, Optional
+from typing import Iterator, List, Dict, Any, Optional, Mapping
 import yaml
 
 from dlt.common.configuration.container import Container
@@ -17,14 +17,14 @@ from dlt.common.pipeline import (
     WithStepInfo,
     reset_resource_state,
 )
-from dlt.common.typing import DictStrAny
+from dlt.common.typing import DictStrAny, TColumnNames
 from dlt.common.runtime import signals
 from dlt.common.runtime.collector import Collector, NULL_COLLECTOR
 from dlt.common.schema import Schema, utils
 from dlt.common.schema.typing import (
     TAnySchemaColumns,
-    TColumnNames,
     TSchemaContract,
+    TTableFormat,
     TWriteDispositionConfig,
 )
 from dlt.common.storages import NormalizeStorageConfiguration, LoadPackageInfo, SchemaStorage
@@ -34,11 +34,11 @@ from dlt.common.storages.load_package import (
     TLoadPackageState,
     commit_load_package_state,
 )
-from dlt.common.utils import get_callable_name, get_full_class_name
+from dlt.common.utils import get_callable_name, get_full_class_name, group_dict_of_lists
 
 from dlt.extract.decorators import SourceInjectableContext, SourceSchemaInjectableContext
 from dlt.extract.exceptions import DataItemRequiredForDynamicTableHints
-from dlt.extract.incremental import IncrementalResourceWrapper
+from dlt.extract.incremental import IncrementalResourceWrapper, Incremental
 from dlt.extract.pipe_iterator import PipeIterator
 from dlt.extract.source import DltSource
 from dlt.extract.resource import DltResource
@@ -50,12 +50,14 @@ from dlt.extract.utils import get_data_item_format
 def data_to_sources(
     data: Any,
     pipeline: SupportsPipeline,
+    *,
     schema: Schema = None,
     table_name: str = None,
     parent_table_name: str = None,
     write_disposition: TWriteDispositionConfig = None,
     columns: TAnySchemaColumns = None,
     primary_key: TColumnNames = None,
+    table_format: TTableFormat = None,
     schema_contract: TSchemaContract = None,
 ) -> List[DltSource]:
     """Creates a list of sources for data items present in `data` and applies specified hints to all resources.
@@ -65,12 +67,13 @@ def data_to_sources(
 
     def apply_hint_args(resource: DltResource) -> None:
         resource.apply_hints(
-            table_name,
-            parent_table_name,
-            write_disposition,
-            columns,
-            primary_key,
+            table_name=table_name,
+            parent_table_name=parent_table_name,
+            write_disposition=write_disposition,
+            columns=columns,
+            primary_key=primary_key,
             schema_contract=schema_contract,
+            table_format=table_format,
         )
 
     def apply_settings(source_: DltSource) -> None:
@@ -84,7 +87,12 @@ def data_to_sources(
             schema_ = schema
         # take pipeline schema to make newest version visible to the resources
         elif pipeline.default_schema_name:
-            schema_ = pipeline.schemas[pipeline.default_schema_name].clone()
+            # clones with name which will drop previous hashes
+            schema_ = pipeline.schemas[pipeline.default_schema_name].clone(
+                with_name=pipeline.default_schema_name
+            )
+            # delete data tables
+            schema_.drop_tables(schema_.data_table_names(include_incomplete=True))
         else:
             schema_ = pipeline._make_schema_with_default_name()
         return schema_
@@ -93,7 +101,8 @@ def data_to_sources(
 
     # a list of sources or a list of resources may be passed as data
     sources: List[DltSource] = []
-    resources: List[DltResource] = []
+    resources: Dict[str, List[DltResource]] = {}
+    data_resources: List[DltResource] = []
 
     def append_data(data_item: Any) -> None:
         if isinstance(data_item, DltSource):
@@ -102,13 +111,13 @@ def data_to_sources(
                 data_item.schema = schema
             sources.append(data_item)
         elif isinstance(data_item, DltResource):
-            # do not set section to prevent source that represent a standalone resource
-            # to overwrite other standalone resources (ie. parents) in that source
-            sources.append(DltSource(effective_schema, "", [data_item]))
+            # many resources with the same name may be present
+            r_ = resources.setdefault(data_item.name, [])
+            r_.append(data_item)
         else:
             # iterator/iterable/generator
             # create resource first without table template
-            resources.append(
+            data_resources.append(
                 DltResource.from_data(data_item, name=table_name, section=pipeline.pipeline_name)
             )
 
@@ -122,9 +131,17 @@ def data_to_sources(
     else:
         append_data(data)
 
-    # add all the appended resources in one source
+    # add all appended resource instances in one source
     if resources:
-        sources.append(DltSource(effective_schema, pipeline.pipeline_name, resources))
+        # decompose into groups so at most single resource with a given name belongs to a group
+        for r_ in group_dict_of_lists(resources):
+            # do not set section to prevent source that represent a standalone resource
+            # to overwrite other standalone resources (ie. parents) in that source
+            sources.append(DltSource(effective_schema, "", list(r_.values())))
+
+    # add all the appended data-like items in one source
+    if data_resources:
+        sources.append(DltSource(effective_schema, pipeline.pipeline_name, data_resources))
 
     # apply hints and settings
     for source in sources:
@@ -269,8 +286,8 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
             if resource.name not in tables_by_resources:
                 continue
             for table in tables_by_resources[resource.name]:
-                # we only need to write empty files for the top tables
-                if not table.get("parent", None):
+                # we only need to write empty files for the root tables
+                if not utils.is_nested_table(table):
                     json_extractor.write_empty_items_file(table["name"])
 
         # collect resources that received empty materialized lists and had no items
@@ -287,8 +304,8 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
                 if tables := tables_by_resources.get("resource_name"):
                     # write empty tables
                     for table in tables:
-                        # we only need to write empty files for the top tables
-                        if not table.get("parent", None):
+                        # we only need to write empty files for the root tables
+                        if not utils.is_nested_table(table):
                             json_extractor.write_empty_items_file(table["name"])
                 else:
                     table_name = json_extractor._get_static_table_name(resource, None)

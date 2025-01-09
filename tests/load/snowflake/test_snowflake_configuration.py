@@ -4,11 +4,13 @@ from pathlib import Path
 from urllib3.util import parse_url
 
 from dlt.common.configuration.utils import add_config_to_env
+from dlt.common.exceptions import TerminalValueError
+from dlt.destinations.impl.snowflake.snowflake import SnowflakeLoadJob
 from tests.utils import TEST_DICT_CONFIG_PROVIDER
 
 pytest.importorskip("snowflake")
 
-from dlt.common.libs.sql_alchemy import make_url
+from dlt.common.libs.sql_alchemy_compat import make_url
 from dlt.common.configuration.resolve import resolve_configuration
 from dlt.common.configuration.exceptions import ConfigurationValueError
 from dlt.common.utils import digest128
@@ -152,8 +154,8 @@ def test_overwrite_query_value_from_explicit() -> None:
 
 def test_to_connector_params_private_key() -> None:
     creds = SnowflakeCredentials()
-    creds.private_key = PKEY_PEM_STR  # type: ignore[assignment]
-    creds.private_key_passphrase = PKEY_PASSPHRASE  # type: ignore[assignment]
+    creds.private_key = PKEY_PEM_STR
+    creds.private_key_passphrase = PKEY_PASSPHRASE
     creds.username = "user1"
     creds.database = "db1"
     creds.host = "host1"
@@ -177,8 +179,8 @@ def test_to_connector_params_private_key() -> None:
     )
 
     creds = SnowflakeCredentials()
-    creds.private_key = PKEY_DER_STR  # type: ignore[assignment]
-    creds.private_key_passphrase = PKEY_PASSPHRASE  # type: ignore[assignment]
+    creds.private_key = PKEY_DER_STR
+    creds.private_key_passphrase = PKEY_PASSPHRASE
     creds.username = "user1"
     creds.database = "db1"
     creds.host = "host1"
@@ -271,3 +273,27 @@ def test_snowflake_configuration() -> None:
         explicit_value="snowflake://user1:pass@host1/db1?warehouse=warehouse1&role=role1",
     )
     assert SnowflakeClientConfiguration(credentials=c).fingerprint() == digest128("host1")
+
+
+def test_snowflake_azure_converter() -> None:
+    with pytest.raises(TerminalValueError):
+        SnowflakeLoadJob.ensure_snowflake_azure_url("az://dlt-ci-test-bucket")
+
+    azure_url = SnowflakeLoadJob.ensure_snowflake_azure_url("az://dlt-ci-test-bucket", "my_account")
+    assert azure_url == "azure://my_account.blob.core.windows.net/dlt-ci-test-bucket"
+
+    azure_url = SnowflakeLoadJob.ensure_snowflake_azure_url(
+        "az://dlt-ci-test-bucket/path/to/file.parquet", "my_account"
+    )
+    assert (
+        azure_url
+        == "azure://my_account.blob.core.windows.net/dlt-ci-test-bucket/path/to/file.parquet"
+    )
+
+    azure_url = SnowflakeLoadJob.ensure_snowflake_azure_url(
+        "abfss://dlt-ci-test-bucket@my_account.blob.core.windows.net/path/to/file.parquet"
+    )
+    assert (
+        azure_url
+        == "azure://my_account.blob.core.windows.net/dlt-ci-test-bucket/path/to/file.parquet"
+    )

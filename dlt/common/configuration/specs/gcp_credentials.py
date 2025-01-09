@@ -11,9 +11,11 @@ from dlt.common.configuration.specs.exceptions import (
     InvalidGoogleServicesJson,
     NativeValueError,
     OAuth2ScopesRequired,
+    UnsupportedAuthenticationMethodException,
 )
+from dlt.common.configuration.specs.mixins import WithObjectStoreRsCredentials, WithPyicebergConfig
 from dlt.common.exceptions import MissingDependencyException
-from dlt.common.typing import DictStrAny, TSecretValue, StrAny
+from dlt.common.typing import DictStrAny, TSecretStrValue, StrAny
 from dlt.common.configuration.specs.base_configuration import (
     CredentialsConfiguration,
     CredentialsWithDefault,
@@ -23,7 +25,7 @@ from dlt.common.utils import is_interactive
 
 
 @configspec
-class GcpCredentials(CredentialsConfiguration):
+class GcpCredentials(CredentialsConfiguration, WithObjectStoreRsCredentials, WithPyicebergConfig):
     token_uri: Final[str] = dataclasses.field(
         default="https://oauth2.googleapis.com/token", init=False, repr=False, compare=False
     )
@@ -52,7 +54,7 @@ class GcpCredentials(CredentialsConfiguration):
 
     def to_gcs_credentials(self) -> Dict[str, Any]:
         """
-        Dict of keyword arguments can be passed to gcsfs.
+        Dict of keyword arguments that can be passed to gcsfs.
         Delegates default GCS credential handling to gcsfs.
         """
         return {
@@ -64,10 +66,19 @@ class GcpCredentials(CredentialsConfiguration):
             ),
         }
 
+    def to_object_store_rs_credentials(self) -> Dict[str, str]:
+        """
+        Dict of keyword arguments that can be passed to `object_store` Rust crate.
+        Delegates default GCS credential handling to `object_store` Rust crate.
+        """
+        if isinstance(self, CredentialsWithDefault) and self.has_default_credentials():
+            return {}
+        return {"service_account_key": json.dumps(dict(self))}
+
 
 @configspec
 class GcpServiceAccountCredentialsWithoutDefaults(GcpCredentials):
-    private_key: TSecretValue = None
+    private_key: TSecretStrValue = None
     private_key_id: Optional[str] = None
     client_email: str = None
     type: Final[str] = dataclasses.field(  # noqa: A003
@@ -105,7 +116,7 @@ class GcpServiceAccountCredentialsWithoutDefaults(GcpCredentials):
     def on_resolved(self) -> None:
         if self.private_key and self.private_key[-1] != "\n":
             # must end with new line, otherwise won't be parsed by Crypto
-            self.private_key = TSecretValue(self.private_key + "\n")
+            self.private_key = self.private_key + "\n"
 
     def to_native_credentials(self) -> Any:
         """Returns google.oauth2.service_account.Credentials"""
@@ -117,9 +128,11 @@ class GcpServiceAccountCredentialsWithoutDefaults(GcpCredentials):
         else:
             return ServiceAccountCredentials.from_service_account_info(self)
 
-    def to_object_store_rs_credentials(self) -> Dict[str, str]:
-        # https://docs.rs/object_store/latest/object_store/gcp
-        return {"service_account_key": json.dumps(dict(self))}
+    def to_pyiceberg_fileio_config(self) -> Dict[str, Any]:
+        raise UnsupportedAuthenticationMethodException(
+            "Service Account authentication not supported with `iceberg` table format. Use OAuth"
+            " authentication instead."
+        )
 
     def __str__(self) -> str:
         return f"{self.client_email}@{self.project_id}"
@@ -128,7 +141,7 @@ class GcpServiceAccountCredentialsWithoutDefaults(GcpCredentials):
 @configspec
 class GcpOAuthCredentialsWithoutDefaults(GcpCredentials, OAuth2Credentials):
     # only desktop app supported
-    refresh_token: TSecretValue = None
+    refresh_token: TSecretStrValue = None
     client_type: Final[str] = dataclasses.field(
         default="installed", init=False, repr=False, compare=False
     )
@@ -171,10 +184,18 @@ class GcpOAuthCredentialsWithoutDefaults(GcpCredentials, OAuth2Credentials):
         return json.dumps(self._info_dict())
 
     def to_object_store_rs_credentials(self) -> Dict[str, str]:
-        raise NotImplementedError(
-            "`object_store` Rust crate does not support OAuth for GCP credentials. Reference:"
-            " https://docs.rs/object_store/latest/object_store/gcp."
+        raise UnsupportedAuthenticationMethodException(
+            "OAuth authentication not supported with `delta` table format. Use Service Account or"
+            " Application Default Credentials authentication instead."
         )
+
+    def to_pyiceberg_fileio_config(self) -> Dict[str, Any]:
+        self.auth()
+        return {
+            "gcs.project-id": self.project_id,
+            "gcs.oauth2.token": self.token,
+            "gcs.oauth2.token-expires-at": (pendulum.now().timestamp() + 60) * 1000,
+        }
 
     def auth(self, scopes: Union[str, List[str]] = None, redirect_url: str = None) -> None:
         if not self.refresh_token:
@@ -195,13 +216,13 @@ class GcpOAuthCredentialsWithoutDefaults(GcpCredentials, OAuth2Credentials):
     def on_partial(self) -> None:
         """Allows for an empty refresh token if the session is interactive or tty is attached"""
         if sys.stdin.isatty() or is_interactive():
-            self.refresh_token = TSecretValue("")
+            self.refresh_token = ""
             # still partial - raise
             if not self.is_partial():
                 self.resolve()
             self.refresh_token = None
 
-    def _get_access_token(self) -> TSecretValue:
+    def _get_access_token(self) -> str:
         try:
             from requests_oauthlib import OAuth2Session
         except ModuleNotFoundError:
@@ -209,19 +230,19 @@ class GcpOAuthCredentialsWithoutDefaults(GcpCredentials, OAuth2Credentials):
 
         google = OAuth2Session(client_id=self.client_id, scope=self.scopes)
         extra = {"client_id": self.client_id, "client_secret": self.client_secret}
-        token = google.refresh_token(
+        token: str = google.refresh_token(
             token_url=self.token_uri, refresh_token=self.refresh_token, **extra
         )["access_token"]
-        return TSecretValue(token)
+        return token
 
-    def _get_refresh_token(self, redirect_url: str) -> Tuple[TSecretValue, TSecretValue]:
+    def _get_refresh_token(self, redirect_url: str) -> Tuple[str, str]:
         try:
             from google_auth_oauthlib.flow import InstalledAppFlow
         except ModuleNotFoundError:
             raise MissingDependencyException("GcpOAuthCredentials", ["google-auth-oauthlib"])
         flow = InstalledAppFlow.from_client_config(self._installed_dict(redirect_url), self.scopes)
         credentials = flow.run_local_server(port=0)
-        return TSecretValue(credentials.refresh_token), TSecretValue(credentials.token)
+        return credentials.refresh_token, credentials.token
 
     def to_native_credentials(self) -> Any:
         """Returns google.oauth2.credentials.Credentials"""
@@ -308,6 +329,12 @@ class GcpDefaultCredentials(CredentialsWithDefault, GcpCredentials):
         else:
             return super().to_native_credentials()
 
+    def to_pyiceberg_fileio_config(self) -> Dict[str, Any]:
+        raise UnsupportedAuthenticationMethodException(
+            "Application Default Credentials authentication not supported with `iceberg` table"
+            " format. Use OAuth authentication instead."
+        )
+
 
 @configspec
 class GcpServiceAccountCredentials(
@@ -329,3 +356,9 @@ class GcpOAuthCredentials(GcpDefaultCredentials, GcpOAuthCredentialsWithoutDefau
         except NativeValueError:
             pass
         GcpOAuthCredentialsWithoutDefaults.parse_native_representation(self, native_value)
+
+    def to_pyiceberg_fileio_config(self) -> Dict[str, Any]:
+        if self.has_default_credentials():
+            return GcpDefaultCredentials.to_pyiceberg_fileio_config(self)
+        else:
+            return GcpOAuthCredentialsWithoutDefaults.to_pyiceberg_fileio_config(self)

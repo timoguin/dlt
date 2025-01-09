@@ -1,9 +1,13 @@
+from types import SimpleNamespace
+
+import pytest
 from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
     ClassVar,
     Final,
+    Generic,
     List,
     Literal,
     Mapping,
@@ -12,7 +16,6 @@ from typing import (
     NewType,
     Sequence,
     TypeVar,
-    TypedDict,
     Optional,
     Union,
 )
@@ -20,6 +23,7 @@ from typing_extensions import Annotated, get_args
 from uuid import UUID
 
 
+from dlt import TSecretValue
 from dlt.common.configuration.specs.base_configuration import (
     BaseConfiguration,
     get_config_if_union_hint,
@@ -27,6 +31,7 @@ from dlt.common.configuration.specs.base_configuration import (
 from dlt.common.configuration.specs import GcpServiceAccountCredentialsWithoutDefaults
 from dlt.common.typing import (
     StrAny,
+    TSecretStrValue,
     extract_inner_type,
     extract_union_types,
     get_all_types_of_class_in_union,
@@ -40,6 +45,9 @@ from dlt.common.typing import (
     is_union_type,
     is_annotated,
     is_callable_type,
+    add_value_to_literal,
+    get_generic_type_argument_from_instance,
+    TypedDict,
 )
 
 
@@ -270,3 +278,58 @@ def test_get_all_types_of_class_in_union() -> None:
     assert get_all_types_of_class_in_union(
         Union[BaseConfiguration, str], Incremental[float], with_superclass=True
     ) == [BaseConfiguration]
+
+
+def test_secret_type() -> None:
+    # typing must be ok
+    val: TSecretValue = 1  # noqa
+    val_2: TSecretValue = b"ABC"  # noqa
+
+    # must evaluate to self at runtime
+    assert TSecretValue("a") == "a"
+    assert TSecretValue(b"a") == b"a"
+    assert TSecretValue(7) == 7
+    assert isinstance(TSecretValue(7), int)
+
+    # secret str evaluates to str
+    val_str: TSecretStrValue = "x"  # noqa
+    # here we expect ignore!
+    val_str_err: TSecretStrValue = 1  # type: ignore[assignment] # noqa
+
+    assert TSecretStrValue("x_str") == "x_str"
+    assert TSecretStrValue({}) == "{}"
+
+
+def test_add_value_to_literal() -> None:
+    TestLiteral = Literal["red", "blue"]
+
+    add_value_to_literal(TestLiteral, "green")
+
+    assert get_args(TestLiteral) == ("red", "blue", "green")
+
+    add_value_to_literal(TestLiteral, "red")
+    assert get_args(TestLiteral) == ("red", "blue", "green")
+
+    TestSingleLiteral = Literal["red"]
+    add_value_to_literal(TestSingleLiteral, "green")
+    add_value_to_literal(TestSingleLiteral, "blue")
+    assert get_args(TestSingleLiteral) == ("red", "green", "blue")
+
+
+def test_get_generic_type_argument_from_instance() -> None:
+    T = TypeVar("T")
+
+    class Foo(Generic[T]):
+        pass
+
+    # generic contains hint
+    instance = SimpleNamespace(__orig_class__=Foo[str])
+    assert get_generic_type_argument_from_instance(instance) is str
+    instance = SimpleNamespace(__orig_class__=Optional[Foo[str]])
+    assert get_generic_type_argument_from_instance(instance) is str
+
+    # with sample values
+    instance = SimpleNamespace(__orig_class__=Foo[Any])
+    assert get_generic_type_argument_from_instance(instance, 1) is int
+    instance = SimpleNamespace(__orig_class__=Optional[Foo[Any]])
+    assert get_generic_type_argument_from_instance(instance, 1) is int

@@ -1,6 +1,6 @@
 """
 ---
-title: Custom Destination with LanceDB
+title: Custom destination with LanceDB
 description: Learn how use the custom destination to load to LanceDB.
 keywords: [destination, credentials, example, lancedb, custom destination, vectorstore, AI, LLM]
 ---
@@ -21,7 +21,6 @@ We'll learn how to:
 __source_name__ = "spotify"
 
 import datetime  # noqa: I251
-import os
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -93,7 +92,7 @@ def spotify_shows(
     spotify_base_api_url = "https://api.spotify.com/v1"
     client = RESTClient(
         base_url=spotify_base_api_url,
-        auth=SpotifyAuth(client_id=client_id, client_secret=client_secret),  # type: ignore[arg-type]
+        auth=SpotifyAuth(client_id=client_id, client_secret=client_secret),
     )
 
     for show in fields(Shows):
@@ -142,7 +141,6 @@ if __name__ == "__main__":
     )
 
     load_info = pipeline.run(spotify_shows())
-    load_info.raise_on_failed_jobs()
     print(load_info)
 
     row_counts = pipeline.last_trace.last_normalize_info

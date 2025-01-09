@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "dlt"
-version = "0.5.2"
+version = "1.5.0"
 description = "dlt is an open-source python-first scalable data loading library that does not require any backend to run."
 authors = ["dltHub Inc. <services@dlthub.com>"]
 maintainers = [ "Marcin Rudolf <marcin@dlthub.com>", "Adrian Brudaru <adrian@dlthub.com>", "Anton Burnashev <anton@dlthub.com>", "David Scharf <david@dlthub.com>" ]
@@ -18,7 +18,7 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Operating System :: Microsoft :: Windows",]
 keywords = [ "etl" ]
-include = [ "LICENSE.txt", "README.md"]
+include = [ "LICENSE.txt", "README.md", "dlt/sources/pipeline_templates/.gitignore", "dlt/sources/pipeline_templates/.dlt/config.toml" ]
 packages = [
     { include = "dlt" },
 ]
@@ -29,7 +29,7 @@ requests = ">=2.26.0"
 pendulum = ">=2.1.2"
 simplejson = ">=3.17.5"
 PyYAML = ">=5.4.1"
-semver = ">=2.13.0"
+semver = ">=3.0.0"
 hexbytes = ">=0.2.2"
 tzdata = ">=2022.1"
 tomlkit = ">=0.11.3"
@@ -40,7 +40,7 @@ click = ">=7.1"
 requirements-parser = ">=0.5.0"
 setuptools = ">=65.6.0"
 humanize = ">=4.4.0"
-astunparse = ">=1.6.3"
+astunparse = { "version" = ">=1.6.3", "python" = "<3.9"}
 gitpython = ">=3.1.29"
 pytz = ">=2022.6"
 giturlparse = ">=0.10.0"
@@ -50,7 +50,9 @@ tenacity = ">=8.0.2"
 jsonpath-ng = ">=1.5.3"
 fsspec = ">=2022.4.0"
 packaging = ">=21.1"
+pluggy = ">=1.3.0"
 win-precise-time = {version = ">=1.4.2", markers="os_name == 'nt'"}
+graphlib-backport = {version = "*", python = "<3.9"}
 
 psycopg2-binary = {version = ">=2.9.1", optional = true}
 # use this dependency as the current version of psycopg2cffi does not have sql module
@@ -59,7 +61,7 @@ psycopg2cffi = {version = ">=2.9.0", optional = true, markers="platform_python_i
 grpcio = {version = ">=1.50.0", optional = true}
 google-cloud-bigquery = {version = ">=2.26.0", optional = true}
 pyarrow = {version = ">=12.0.0", optional = true}
-duckdb = {version = ">=0.6.1,<0.11", optional = true}
+duckdb = {version = ">=0.9", optional = true}
 # keep per-python version dependency as a reference
 # duckdb = [
 #     {version = ">=0.6.1,<0.10.0", python = ">=3.8,<3.12", optional = true},
@@ -73,27 +75,41 @@ cron-descriptor = {version = ">=1.2.32", optional = true}
 pipdeptree = {version = ">=2.9.0,<2.10", optional = true}
 pyathena = {version = ">=2.9.6", optional = true}
 weaviate-client = {version = ">=3.22", optional = true}
-adlfs = {version = ">=2022.4.0", optional = true}
+adlfs = {version = ">=2024.7.0", optional = true}
 pyodbc = {version = ">=4.0.39", optional = true}
 qdrant-client = {version = ">=1.8", optional = true, extras = ["fastembed"]}
 databricks-sql-connector = {version = ">=2.9.3", optional = true}
 clickhouse-driver = { version = ">=0.2.7", optional = true }
 clickhouse-connect = { version = ">=0.7.7", optional = true }
 lancedb = { version = ">=0.8.2", optional = true, markers = "python_version >= '3.9'", allow-prereleases = true }
-deltalake = { version = ">=0.17.4", optional = true }
+tantivy = { version = ">= 0.22.0", optional = true }
+deltalake = { version = ">=0.21.0", optional = true }
+sqlalchemy = { version = ">=1.4", optional = true }
+alembic = {version = ">1.10.0", optional = true}
+paramiko = {version = ">=3.3.0", optional = true}
+sqlglot = {version = ">=20.0.0", optional = true}
+db-dtypes = { version = ">=1.2.0", optional = true }
+# `sql-sqlite` extra leads to dependency conflict with `apache-airflow` because `apache-airflow`
+# requires `sqlalchemy<2.0.0` while the extra requires `sqlalchemy>=2.0.18`
+# https://github.com/apache/airflow/issues/28723
+# pyiceberg = { version = ">=0.7.1", optional = true, extras = ["sql-sqlite"] } 
+# we will rely on manual installation of `sqlalchemy>=2.0.18` instead
+pyiceberg = { version = ">=0.8.1", python = ">=3.9", optional = true }
+databricks-sdk = {version = ">=0.38.0", optional = true}
 
 [tool.poetry.extras]
 gcp = ["grpcio", "google-cloud-bigquery", "db-dtypes", "gcsfs"]
 # bigquery is alias on gcp extras
-bigquery = ["grpcio", "google-cloud-bigquery", "pyarrow", "db-dtypes", "gcsfs"]
+bigquery = ["grpcio", "google-cloud-bigquery", "pyarrow", "gcsfs", "db-dtypes"]
 postgres = ["psycopg2-binary", "psycopg2cffi"]
 redshift = ["psycopg2-binary", "psycopg2cffi"]
 parquet = ["pyarrow"]
 duckdb = ["duckdb"]
-filesystem = ["s3fs", "botocore"]
+filesystem = ["s3fs", "botocore", "sqlglot"]
 s3 = ["s3fs", "botocore"]
 gs = ["gcsfs"]
 az = ["adlfs"]
+sftp = ["paramiko"]
 snowflake = ["snowflake-connector-python"]
 motherduck = ["duckdb", "pyarrow"]
 cli = ["pipdeptree", "cron-descriptor"]
@@ -102,12 +118,15 @@ weaviate = ["weaviate-client"]
 mssql = ["pyodbc"]
 synapse = ["pyodbc", "adlfs", "pyarrow"]
 qdrant = ["qdrant-client"]
-databricks = ["databricks-sql-connector"]
+databricks = ["databricks-sql-connector", "databricks-sdk"]
 clickhouse = ["clickhouse-driver", "clickhouse-connect", "s3fs", "gcsfs", "adlfs", "pyarrow"]
 dremio = ["pyarrow"]
-lancedb = ["lancedb", "pyarrow"]
+lancedb = ["lancedb", "pyarrow", "tantivy"]
 deltalake = ["deltalake", "pyarrow"]
-
+sql_database = ["sqlalchemy"]
+sqlalchemy = ["sqlalchemy", "alembic"]
+pyiceberg = ["pyiceberg", "pyarrow", "sqlalchemy"]
+postgis = ["psycopg2-binary", "psycopg2cffi"]
 
 [tool.poetry.scripts]
 dlt = "dlt.cli._dlt:_main"
@@ -123,7 +142,7 @@ sqlfluff = "^2.3.2"
 types-deprecated = "^1.2.9.2"
 pytest-console-scripts = "^1.4.1"
 pytest = "^7.0.0"
-mypy = "^1.10.0"
+mypy = ">=1.11.0,<1.13.0"
 flake8 = "^5.0.0"
 bandit = "^1.7.0"
 black = "^23.7.0"
@@ -155,6 +174,18 @@ pyjwt = "^2.8.0"
 pytest-mock = "^3.14.0"
 types-regex = "^2024.5.15.20240519"
 flake8-print = "^5.0.0"
+mimesis = "^7.0.0"
+shapely = ">=2.0.6"
+
+[tool.poetry.group.sources]
+optional = true
+[tool.poetry.group.sources.dependencies]
+connectorx = [
+    {version = "0.3.2", python = "3.8"},
+    {version = ">=0.3.3", python = ">=3.9"}
+]
+pymysql = "^1.1.0"
+openpyxl = "^3"
 
 [tool.poetry.group.pipeline]
 optional = true
@@ -173,12 +204,19 @@ pandas = [
     {version = ">2.1", markers = "python_version >= '3.12'"},
     {version = "<2.1", markers = "python_version < '3.12'"}
 ]
+sqlglot = {version = ">=20.0.0"}
 
 [tool.poetry.group.airflow]
 optional = true
 
 [tool.poetry.group.airflow.dependencies]
 apache-airflow = {version = "^2.8.0", markers = "python_version < '3.12'"}
+
+[tool.poetry.group.ibis]
+optional = true
+
+[tool.poetry.group.ibis.dependencies]
+ibis-framework = { version = ">=9.0.0,<10.0.0", markers = "python_version >= '3.10'", extras = ["duckdb", "postgres", "bigquery", "snowflake", "mssql", "clickhouse"]}
 
 [tool.poetry.group.providers]
 optional = true
@@ -212,16 +250,17 @@ SQLAlchemy = ">=1.4.0"
 pymysql = "^1.1.0"
 pypdf2 = "^3.0.1"
 pydoc-markdown = "^4.8.2"
-connectorx = "0.3.2"
 dbt-core = ">=1.2.0"
 dbt-duckdb = ">=1.2.0"
 pymongo = ">=4.3.3"
 pandas = ">2"
 alive-progress = ">=3.0.1"
-pyarrow = ">=14.0.0"
+pyarrow = ">=17.0.0"
 psycopg2-binary = ">=2.9"
 lancedb = { version = ">=0.8.2", markers = "python_version >= '3.9'", allow-prereleases = true }
-openai = ">=1.35"
+openai = ">=1.45"
+connectorx = { version = ">=0.3.2" }
+modal = ">=0.64.170"
 
 [tool.black] # https://black.readthedocs.io/en/stable/usage_and_configuration/the_basics.html#configuration-via-a-file
 line-length = 100

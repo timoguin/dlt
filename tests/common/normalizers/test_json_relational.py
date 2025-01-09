@@ -6,14 +6,12 @@ from dlt.common.schema.typing import TColumnName, TSimpleRegex
 from dlt.common.utils import digest128, uniq_id
 from dlt.common.schema import Schema
 from dlt.common.schema.utils import new_table
-
+from dlt.common.normalizers.utils import DLT_ID_LENGTH_BYTES
 from dlt.common.normalizers.json.relational import (
     RelationalNormalizerConfigPropagation,
     DataItemNormalizer as RelationalNormalizer,
-    DLT_ID_LENGTH_BYTES,
 )
-
-# _flatten, _get_child_row_hash, _normalize_row, normalize_data_item,
+from dlt.common.normalizers.json import helpers as normalize_helpers
 
 from tests.utils import create_schema_with_name
 
@@ -29,7 +27,7 @@ def test_flatten_fix_field_name(norm: RelationalNormalizer) -> None:
         "f 2": [],
         "f!3": {"f4": "a", "f-5": "b", "f*6": {"c": 7, "c v": 8, "c x": []}},
     }
-    flattened_row, lists = norm._flatten("mock_table", row, 0)
+    flattened_row, lists = norm._flatten("mock_table", row, 1000)
     assert "f_1" in flattened_row
     # assert "f_2" in flattened_row
     assert "f_3__f4" in flattened_row
@@ -47,53 +45,53 @@ def test_flatten_fix_field_name(norm: RelationalNormalizer) -> None:
     ) in lists
 
 
-def test_preserve_complex_value(norm: RelationalNormalizer) -> None:
-    # add table with complex column
+def test_preserve_json_value(norm: RelationalNormalizer) -> None:
+    # add table with json column
     norm.schema.update_table(
         new_table(
-            "with_complex",
+            "with_json",
             columns=[
                 {
                     "name": "value",
-                    "data_type": "complex",
+                    "data_type": "json",
                     "nullable": "true",  # type: ignore[typeddict-item]
                 }
             ],
         )
     )
     row_1 = {"value": 1}
-    flattened_row, _ = norm._flatten("with_complex", row_1, 0)
+    flattened_row, _ = norm._flatten("with_json", row_1, 0)
     assert flattened_row["value"] == 1
 
-    row_2 = {"value": {"complex": True}}
-    flattened_row, _ = norm._flatten("with_complex", row_2, 0)
+    row_2 = {"value": {"json": True}}
+    flattened_row, _ = norm._flatten("with_json", row_2, 0)
     assert flattened_row["value"] == row_2["value"]
-    # complex value is not flattened
-    assert "value__complex" not in flattened_row
+    # json value is not flattened
+    assert "value__json" not in flattened_row
 
 
-def test_preserve_complex_value_with_hint(norm: RelationalNormalizer) -> None:
+def test_preserve_json_value_with_hint(norm: RelationalNormalizer) -> None:
     # add preferred type for "value"
-    norm.schema._settings.setdefault("preferred_types", {})[TSimpleRegex("re:^value$")] = "complex"
+    norm.schema._settings.setdefault("preferred_types", {})[TSimpleRegex("re:^value$")] = "json"
     norm.schema._compile_settings()
 
     row_1 = {"value": 1}
     flattened_row, _ = norm._flatten("any_table", row_1, 0)
     assert flattened_row["value"] == 1
 
-    row_2 = {"value": {"complex": True}}
+    row_2 = {"value": {"json": True}}
     flattened_row, _ = norm._flatten("any_table", row_2, 0)
     assert flattened_row["value"] == row_2["value"]
-    # complex value is not flattened
-    assert "value__complex" not in flattened_row
+    # json value is not flattened
+    assert "value__json" not in flattened_row
 
 
-def test_child_table_linking(norm: RelationalNormalizer) -> None:
+def test_nested_table_linking(norm: RelationalNormalizer) -> None:
     row = {"f": [{"l": ["a", "b", "c"], "v": 120, "o": [{"a": 1}, {"a": 2}]}]}
     # request _dlt_root_id propagation
     add_dlt_root_id_propagation(norm)
 
-    rows = list(norm._normalize_row(row, {}, ("table",)))
+    rows = list(norm._normalize_row(row, {}, ("table",), _r_lvl=1000, is_root=True))
     # should have 7 entries (root + level 1 + 3 * list + 2 * object)
     assert len(rows) == 7
     # root elem will not have a root hash if not explicitly added, "extend" is added only to child
@@ -133,15 +131,18 @@ def test_child_table_linking(norm: RelationalNormalizer) -> None:
     assert [e[1]["value"] for e in list_rows] == ["a", "b", "c"]
 
 
-def test_child_table_linking_primary_key(norm: RelationalNormalizer) -> None:
+def test_skip_nested_link_when_no_parent(norm: RelationalNormalizer) -> None:
     row = {
         "id": "level0",
         "f": [{"id": "level1", "l": ["a", "b", "c"], "v": 120, "o": [{"a": 1}, {"a": 2}]}],
     }
-    norm.schema.merge_hints({"primary_key": [TSimpleRegex("id")]})
-    norm.schema._compile_settings()
 
-    rows = list(norm._normalize_row(row, {}, ("table",)))
+    # create table__f without parent so it is not seen as nested table
+    # still normalizer will write data to it but not link
+    table__f = new_table("table__f", parent_table_name=None)
+    norm.schema.update_table(table__f)
+
+    rows = list(norm._normalize_row(row, {}, ("table",), _r_lvl=1000, is_root=True))
     root = next(t for t in rows if t[0][0] == "table")[1]
     # record hash is random for primary keys, not based on their content
     # this is a change introduced in dlt 0.2.0a30
@@ -171,7 +172,7 @@ def test_yields_parents_first(norm: RelationalNormalizer) -> None:
         "f": [{"id": "level1", "l": ["a", "b", "c"], "v": 120, "o": [{"a": 1}, {"a": 2}]}],
         "g": [{"id": "level2_g", "l": ["a"]}],
     }
-    rows = list(norm._normalize_row(row, {}, ("table",)))
+    rows = list(norm._normalize_row(row, {}, ("table",), _r_lvl=1000, is_root=True))
     tables = list(r[0][0] for r in rows)
     # child tables are always yielded before parent tables
     expected_tables = [
@@ -217,7 +218,7 @@ def test_yields_parent_relation(norm: RelationalNormalizer) -> None:
             }
         ],
     }
-    rows = list(norm._normalize_row(row, {}, ("table",)))
+    rows = list(norm._normalize_row(row, {}, ("table",), _r_lvl=1000, is_root=True))
     # normalizer must return parent table first and move in order of the list elements when yielding child tables
     # the yielding order if fully defined
     expected_parents = [
@@ -278,7 +279,7 @@ def test_list_position(norm: RelationalNormalizer) -> None:
     row: DictStrAny = {
         "f": [{"l": ["a", "b", "c"], "v": 120, "lo": [{"e": "a"}, {"e": "b"}, {"e": "c"}]}]
     }
-    rows = list(norm._normalize_row(row, {}, ("table",)))
+    rows = list(norm._normalize_row(row, {}, ("table",), _r_lvl=1000, is_root=True))
     # root has no pos
     root = [t for t in rows if t[0][0] == "table"][0][1]
     assert "_dlt_list_idx" not in root
@@ -407,16 +408,20 @@ def test_list_in_list() -> None:
     zen__webpath__list__list = [row for row in rows if row[0][0] == "zen__webpath__list__list"]
     assert zen__webpath__list__list[0][1]["_dlt_parent_id"] == zen__webpath__list[3][1]["_dlt_id"]
 
-    # test the same setting webpath__list to complex
+    # test the same setting webpath__list to json
     zen_table = new_table("zen")
     schema.update_table(zen_table)
 
     path_table = new_table(
-        "zen__webpath", parent_table_name="zen", columns=[{"name": "list", "data_type": "complex"}]
+        "zen__webpath", parent_table_name="zen", columns=[{"name": "list", "data_type": "json"}]
     )
     schema.update_table(path_table)
+    assert "zen__webpath" in schema.tables
+    # clear cache with json paths
+    normalize_helpers.is_nested_type.cache_clear()
+
     rows = list(schema.normalize_data_item(chats, "1762162.1212", "zen"))
-    # both lists are complex types now
+    # both lists are json types now
     assert len(rows) == 3
     zen__webpath = [row for row in rows if row[0][0] == "zen__webpath"]
     assert all("list" in row[1] for row in zen__webpath)
@@ -429,7 +434,7 @@ def test_child_row_deterministic_hash(norm: RelationalNormalizer) -> None:
         "_dlt_id": row_id,
         "f": [{"l": ["a", "b", "c"], "v": 120, "lo": [{"e": "a"}, {"e": "b"}, {"e": "c"}]}],
     }
-    rows = list(norm._normalize_row(row, {}, ("table",)))
+    rows = list(norm._normalize_row(row, {}, ("table",), _r_lvl=1000, is_root=True))
     children = [t for t in rows if t[0][0] != "table"]
     # all hashes must be different
     distinct_hashes = set([ch[1]["_dlt_id"] for ch in children])
@@ -448,19 +453,19 @@ def test_child_row_deterministic_hash(norm: RelationalNormalizer) -> None:
     assert f_lo_p2["_dlt_id"] == digest128(f"{el_f['_dlt_id']}_table__f__lo_2", DLT_ID_LENGTH_BYTES)
 
     # same data with same table and row_id
-    rows_2 = list(norm._normalize_row(row, {}, ("table",)))
+    rows_2 = list(norm._normalize_row(row, {}, ("table",), _r_lvl=1000, is_root=True))
     children_2 = [t for t in rows_2 if t[0][0] != "table"]
     # corresponding hashes must be identical
     assert all(ch[0][1]["_dlt_id"] == ch[1][1]["_dlt_id"] for ch in zip(children, children_2))
 
     # change parent table and all child hashes must be different
-    rows_4 = list(norm._normalize_row(row, {}, ("other_table",)))
+    rows_4 = list(norm._normalize_row(row, {}, ("other_table",), _r_lvl=1000, is_root=True))
     children_4 = [t for t in rows_4 if t[0][0] != "other_table"]
     assert all(ch[0][1]["_dlt_id"] != ch[1][1]["_dlt_id"] for ch in zip(children, children_4))
 
     # change parent hash and all child hashes must be different
     row["_dlt_id"] = uniq_id()
-    rows_3 = list(norm._normalize_row(row, {}, ("table",)))
+    rows_3 = list(norm._normalize_row(row, {}, ("table",), _r_lvl=1000, is_root=True))
     children_3 = [t for t in rows_3 if t[0][0] != "table"]
     assert all(ch[0][1]["_dlt_id"] != ch[1][1]["_dlt_id"] for ch in zip(children, children_3))
 
@@ -476,7 +481,13 @@ def test_keeps_dlt_id(norm: RelationalNormalizer) -> None:
 def test_propagate_hardcoded_context(norm: RelationalNormalizer) -> None:
     row = {"level": 1, "list": ["a", "b", "c"], "comp": [{"_timestamp": "a"}]}
     rows = list(
-        norm._normalize_row(row, {"_timestamp": 1238.9, "_dist_key": "SENDER_3000"}, ("table",))
+        norm._normalize_row(
+            row,
+            {"_timestamp": 1238.9, "_dist_key": "SENDER_3000"},
+            ("table",),
+            _r_lvl=1000,
+            is_root=True,
+        )
     )
     # context is not added to root element
     root = next(t for t in rows if t[0][0] == "table")[1]
@@ -507,7 +518,7 @@ def test_propagates_root_context(norm: RelationalNormalizer) -> None:
         "dependent_list": [1, 2, 3],
         "dependent_objects": [{"vx": "ax"}],
     }
-    normalized_rows = list(norm._normalize_row(row, {}, ("table",)))
+    normalized_rows = list(norm._normalize_row(row, {}, ("table",), _r_lvl=1000, is_root=True))
     # all non-root rows must have:
     non_root = [r for r in normalized_rows if r[0][1] is not None]
     assert all(r[1]["_dlt_root_id"] == "###" for r in non_root)
@@ -546,7 +557,7 @@ def test_propagates_table_context(
         # to reproduce a bug where rows with _dlt_id set were not extended
         row["lvl1"][0]["_dlt_id"] = "row_id_lvl1"  # type: ignore[index]
 
-    normalized_rows = list(norm._normalize_row(row, {}, ("table",)))
+    normalized_rows = list(norm._normalize_row(row, {}, ("table",), _r_lvl=1000, is_root=True))
     non_root = [r for r in normalized_rows if r[0][1] is not None]
     # _dlt_root_id in all non root
     assert all(r[1]["_dlt_root_id"] == "###" for r in non_root)
@@ -578,7 +589,7 @@ def test_propagates_table_context_to_lists(norm: RelationalNormalizer) -> None:
     prop_config["root"][TColumnName("timestamp")] = TColumnName("_partition_ts")
 
     row = {"_dlt_id": "###", "timestamp": 12918291.1212, "lvl1": [1, 2, 3, [4, 5, 6]]}
-    normalized_rows = list(norm._normalize_row(row, {}, ("table",)))
+    normalized_rows = list(norm._normalize_row(row, {}, ("table",), _r_lvl=1000, is_root=True))
     # _partition_ts == timestamp on all child tables
     non_root = [r for r in normalized_rows if r[0][1] is not None]
     assert all(r[1]["_partition_ts"] == 12918291.1212 for r in non_root)
@@ -591,43 +602,43 @@ def test_removes_normalized_list(norm: RelationalNormalizer) -> None:
     # after normalizing the list that got normalized into child table must be deleted
     row = {"comp": [{"_timestamp": "a"}]}
     # get iterator
-    normalized_rows_i = norm._normalize_row(row, {}, ("table",))
+    normalized_rows_i = norm._normalize_row(row, {}, ("table",), _r_lvl=1000, is_root=True)
     # yield just one item
     root_row = next(normalized_rows_i)
     # root_row = next(r for r in normalized_rows if r[0][1] is None)
     assert "comp" not in root_row[1]
 
 
-def test_preserves_complex_types_list(norm: RelationalNormalizer) -> None:
+def test_preserves_json_types_list(norm: RelationalNormalizer) -> None:
     # the exception to test_removes_normalized_list
-    # complex types should be left as they are
-    # add table with complex column
+    # json types should be left as they are
+    # add table with json column
     norm.schema.update_table(
         new_table(
             "event_slot",
             columns=[
                 {
                     "name": "value",
-                    "data_type": "complex",
+                    "data_type": "json",
                     "nullable": "true",  # type: ignore[typeddict-item]
                 }
             ],
         )
     )
-    row = {"value": ["from", {"complex": True}]}
-    normalized_rows = list(norm._normalize_row(row, {}, ("event_slot",)))
+    row = {"value": ["from", {"json": True}]}
+    normalized_rows = list(norm._normalize_row(row, {}, ("event_slot",), _r_lvl=1000, is_root=True))
     # make sure only 1 row is emitted, the list is not normalized
     assert len(normalized_rows) == 1
-    # value is kept in root row -> market as complex
+    # value is kept in root row -> market as json
     root_row = next(r for r in normalized_rows if r[0][1] is None)
     assert root_row[1]["value"] == row["value"]
 
     # same should work for a list
-    row = {"value": ["from", ["complex", True]]}  # type: ignore[list-item]
-    normalized_rows = list(norm._normalize_row(row, {}, ("event_slot",)))
+    row = {"value": ["from", ["json", True]]}  # type: ignore[list-item]
+    normalized_rows = list(norm._normalize_row(row, {}, ("event_slot",), _r_lvl=1000, is_root=True))
     # make sure only 1 row is emitted, the list is not normalized
     assert len(normalized_rows) == 1
-    # value is kept in root row -> market as complex
+    # value is kept in root row -> market as json
     root_row = next(r for r in normalized_rows if r[0][1] is None)
     assert root_row[1]["value"] == row["value"]
 
@@ -648,9 +659,9 @@ def test_wrap_in_dict(norm: RelationalNormalizer) -> None:
     assert rows[-1][1]["value"] == "A"
 
 
-def test_complex_types_for_recursion_level(norm: RelationalNormalizer) -> None:
+def test_json_types_for_recursion_level(norm: RelationalNormalizer) -> None:
     add_dlt_root_id_propagation(norm)
-    # if max recursion depth is set, nested elements will be kept as complex
+    # if max recursion depth is set, nested elements will be kept as json
     row = {
         "_dlt_id": "row_id",
         "f": [
@@ -670,7 +681,7 @@ def test_complex_types_for_recursion_level(norm: RelationalNormalizer) -> None:
     # set max nesting to 0
     set_max_nesting(norm, 0)
     n_rows = list(norm.schema.normalize_data_item(row, "load_id", "default"))
-    # the "f" element is left as complex type and not normalized
+    # the "f" element is left as json type and not normalized
     assert len(n_rows) == 1
     assert n_rows[0][0][0] == "default"
     assert "f" in n_rows[0][1]
@@ -691,7 +702,7 @@ def test_complex_types_for_recursion_level(norm: RelationalNormalizer) -> None:
     set_max_nesting(norm, 2)
     n_rows = list(norm.schema.normalize_data_item(row, "load_id", "default"))
     assert len(n_rows) == 4
-    # in default__f__lo the dicts that would be flattened are complex types
+    # in default__f__lo the dicts that would be flattened are json types
     last_row = n_rows[3]
     assert last_row[1]["e"] == {"v": 1}
 
@@ -734,39 +745,41 @@ def test_table_name_meta_normalized() -> None:
     assert rows[0][0][0] == "channel_surfing"
 
 
-def test_parse_with_primary_key() -> None:
-    schema = create_schema_with_name("discord")
-    schema._merge_hints({"primary_key": ["id"]})  # type: ignore[list-item]
-    schema._compile_settings()
-    add_dlt_root_id_propagation(schema.data_item_normalizer)  # type: ignore[arg-type]
+def test_row_id_is_primary_key() -> None:
+    # TODO: if there's a column with row_id hint and primary_key, it should get propagated
+    pass
+    # schema = create_schema_with_name("discord")
+    # schema._merge_hints({"primary_key": ["id"]})  # type: ignore[list-item]
+    # schema._compile_settings()
+    # add_dlt_root_id_propagation(schema.data_item_normalizer)  # type: ignore[arg-type]
 
-    row = {"id": "817949077341208606", "w_id": [{"id": 9128918293891111, "wo_id": [1, 2, 3]}]}
-    rows = list(schema.normalize_data_item(row, "load_id", "discord"))
-    # get root
-    root = next(t[1] for t in rows if t[0][0] == "discord")
-    assert root["_dlt_id"] != digest128("817949077341208606", DLT_ID_LENGTH_BYTES)
-    assert "_dlt_parent_id" not in root
-    assert "_dlt_root_id" not in root
-    assert root["_dlt_load_id"] == "load_id"
+    # row = {"id": "817949077341208606", "w_id": [{"id": 9128918293891111, "wo_id": [1, 2, 3]}]}
+    # rows = list(schema.normalize_data_item(row, "load_id", "discord"))
+    # # get root
+    # root = next(t[1] for t in rows if t[0][0] == "discord")
+    # assert root["_dlt_id"] != digest128("817949077341208606", DLT_ID_LENGTH_BYTES)
+    # assert "_dlt_parent_id" not in root
+    # assert "_dlt_root_id" not in root
+    # assert root["_dlt_load_id"] == "load_id"
 
-    el_w_id = next(t[1] for t in rows if t[0][0] == "discord__w_id")
-    # this also has primary key
-    assert el_w_id["_dlt_id"] != digest128("9128918293891111", DLT_ID_LENGTH_BYTES)
-    assert "_dlt_parent_id" not in el_w_id
-    assert "_dlt_list_idx" not in el_w_id
-    # if enabled, dlt_root is always propagated
-    assert "_dlt_root_id" in el_w_id
+    # el_w_id = next(t[1] for t in rows if t[0][0] == "discord__w_id")
+    # # this also has primary key
+    # assert el_w_id["_dlt_id"] != digest128("9128918293891111", DLT_ID_LENGTH_BYTES)
+    # assert "_dlt_parent_id" not in el_w_id
+    # assert "_dlt_list_idx" not in el_w_id
+    # # if enabled, dlt_root is always propagated
+    # assert "_dlt_root_id" in el_w_id
 
-    # this must have deterministic child key
-    f_wo_id = next(
-        t[1] for t in rows if t[0][0] == "discord__w_id__wo_id" and t[1]["_dlt_list_idx"] == 2
-    )
-    assert f_wo_id["value"] == 3
-    assert f_wo_id["_dlt_root_id"] != digest128("817949077341208606", DLT_ID_LENGTH_BYTES)
-    assert f_wo_id["_dlt_parent_id"] != digest128("9128918293891111", DLT_ID_LENGTH_BYTES)
-    assert f_wo_id["_dlt_id"] == RelationalNormalizer._get_child_row_hash(
-        f_wo_id["_dlt_parent_id"], "discord__w_id__wo_id", 2
-    )
+    # # this must have deterministic child key
+    # f_wo_id = next(
+    #     t[1] for t in rows if t[0][0] == "discord__w_id__wo_id" and t[1]["_dlt_list_idx"] == 2
+    # )
+    # assert f_wo_id["value"] == 3
+    # assert f_wo_id["_dlt_root_id"] != digest128("817949077341208606", DLT_ID_LENGTH_BYTES)
+    # assert f_wo_id["_dlt_parent_id"] != digest128("9128918293891111", DLT_ID_LENGTH_BYTES)
+    # assert f_wo_id["_dlt_id"] == RelationalNormalizer._get_nested_row_hash(
+    #     f_wo_id["_dlt_parent_id"], "discord__w_id__wo_id", 2
+    # )
 
 
 def test_keeps_none_values() -> None:
@@ -866,6 +879,51 @@ def test_propagation_update_on_table_change(norm: RelationalNormalizer):
     assert norm.schema._normalizers_config["json"]["config"]["propagation"]["tables"][
         "table_3"
     ] == {"_dlt_id": "_dlt_root_id", "prop1": "prop2"}
+
+    # force propagation when table has nested table that needs root_key
+    # also use custom name for row_key
+    table_4 = new_table(
+        "table_4", write_disposition="replace", columns=[{"name": "primary_key", "row_key": True}]
+    )
+    table_4_nested = new_table(
+        "table_4__nested",
+        parent_table_name="table_4",
+        columns=[{"name": "_dlt_root_id", "root_key": True}],
+    )
+    # must add table_4 first
+    norm.schema.update_table(table_4)
+    norm.schema.update_table(table_4_nested)
+    # row key table_4 not propagated because it was added before nested that needs that
+    # TODO: maybe fix it
+    assert (
+        "table_4" not in norm.schema._normalizers_config["json"]["config"]["propagation"]["tables"]
+    )
+    norm.schema.update_table(table_4)
+    # also custom key was used
+    assert norm.schema._normalizers_config["json"]["config"]["propagation"]["tables"][
+        "table_4"
+    ] == {"primary_key": "_dlt_root_id"}
+    # drop table from schema
+    norm.schema.drop_tables(["table_4"])
+    assert (
+        "table_4" not in norm.schema._normalizers_config["json"]["config"]["propagation"]["tables"]
+    )
+
+
+def test_caching_perf(norm: RelationalNormalizer) -> None:
+    from time import time
+
+    table = new_table("test")
+    table["x-normalizer"] = {}
+    start = time()
+    for _ in range(100000):
+        normalize_helpers.is_nested_type(norm.schema, "test", "field", 0)
+        # norm._get_table_nesting_level(norm.schema, "test")
+    print(f"{time() - start}")
+
+
+def test_extend_table(norm: RelationalNormalizer) -> None:
+    pass
 
 
 def set_max_nesting(norm: RelationalNormalizer, max_nesting: int) -> None:

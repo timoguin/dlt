@@ -10,7 +10,6 @@ from typing import (
     Literal,
     Mapping,
     Sequence,
-    TypedDict,
     TypeVar,
     Optional,
     Union,
@@ -19,13 +18,13 @@ from typing import (
 from dlt.common import Decimal, jsonpath
 from dlt.common.exceptions import DictValidationException
 from dlt.common.schema.typing import (
-    TColumnNames,
     TStoredSchema,
     TColumnSchema,
     TWriteDispositionConfig,
 )
 from dlt.common.schema.utils import simple_regex_validator
-from dlt.common.typing import DictStrStr, StrStr, TDataItem, TSortOrder
+from dlt.common.typing import DictStrStr, StrStr, TDataItem, TSortOrder, TColumnNames, TypedDict
+
 from dlt.common.validation import validate_dict, validate_dict_ignoring_xkeys
 
 
@@ -111,7 +110,7 @@ def test_doc() -> TTestRecord:
 
 def test_validate_schema_cases() -> None:
     with open(
-        "tests/common/cases/schemas/eth/ethereum_schema_v8.yml", mode="r", encoding="utf-8"
+        "tests/common/cases/schemas/eth/ethereum_schema_v11.yml", mode="r", encoding="utf-8"
     ) as f:
         schema_dict: TStoredSchema = yaml.safe_load(f)
 
@@ -334,8 +333,8 @@ def test_typeddict_friendly_exceptions() -> None:
         wrong_dict["write_disposition"] = {"strategy": "scd2"}
         validate_dict(EndpointResource, wrong_dict, ".")
     print(e.value)
-    # Union of 3 types and callable
-    assert len(e.value.nested_exceptions) == 4
+    # Union of 4 types and callable
+    assert len(e.value.nested_exceptions) == 5
 
     # this has wrong disposition string
     with pytest.raises(DictValidationException) as e:
@@ -343,8 +342,8 @@ def test_typeddict_friendly_exceptions() -> None:
         wrong_dict["write_disposition"] = "unknown"  # type: ignore[assignment]
         validate_dict(EndpointResource, wrong_dict, ".")
     print(e.value)
-    # Union of 3 types and callable
-    assert len(e.value.nested_exceptions) == 4
+    # Union of 4 types and callable
+    assert len(e.value.nested_exceptions) == 5
 
     # this has wrong nested type
     with pytest.raises(DictValidationException) as e:

@@ -4,7 +4,7 @@ import os
 import datetime  # noqa: 251
 import humanize
 import contextlib
-
+import threading
 from typing import (
     Any,
     Callable,
@@ -16,39 +16,48 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
-    TYPE_CHECKING,
     Tuple,
     TypeVar,
-    TypedDict,
     Mapping,
     Literal,
 )
 from typing_extensions import NotRequired
 
+from dlt.common.typing import TypedDict
 from dlt.common.configuration import configspec
 from dlt.common.configuration import known_sections
 from dlt.common.configuration.container import Container
 from dlt.common.configuration.exceptions import ContextDefaultCannotBeCreated
 from dlt.common.configuration.specs import ContainerInjectableContext
 from dlt.common.configuration.specs.config_section_context import ConfigSectionContext
-from dlt.common.configuration.paths import get_dlt_data_dir
-from dlt.common.configuration.specs import RunConfiguration
-from dlt.common.destination import TDestinationReferenceArg, TDestination
+from dlt.common.configuration.specs import RuntimeConfiguration
+from dlt.common.destination import TDestinationReferenceArg, AnyDestination
 from dlt.common.destination.exceptions import DestinationHasFailedJobs
-from dlt.common.exceptions import PipelineStateNotAvailable, SourceSectionNotAvailable
+from dlt.common.exceptions import (
+    PipelineStateNotAvailable,
+    SourceSectionNotAvailable,
+    ResourceNameNotAvailable,
+)
+from dlt.common.metrics import (
+    DataWriterMetrics,
+    ExtractDataInfo,
+    ExtractMetrics,
+    LoadMetrics,
+    NormalizeMetrics,
+    StepMetrics,
+)
 from dlt.common.schema import Schema
 from dlt.common.schema.typing import (
-    TColumnNames,
     TColumnSchema,
     TWriteDispositionConfig,
     TSchemaContract,
 )
-from dlt.common.source import get_current_pipe_name
+from dlt.common.storages.load_package import ParsedLoadJobFileName
 from dlt.common.storages.load_storage import LoadPackageInfo
 from dlt.common.time import ensure_pendulum_datetime, precise_time
-from dlt.common.typing import DictStrAny, REPattern, StrAny, SupportsHumanize
+from dlt.common.typing import DictStrAny, REPattern, StrAny, SupportsHumanize, TColumnNames
 from dlt.common.jsonpath import delete_matches, TAnyJsonPath
-from dlt.common.data_writers.writers import DataWriterMetrics, TLoaderFileFormat
+from dlt.common.data_writers.writers import TLoaderFileFormat
 from dlt.common.utils import RowCounts, merge_row_counts
 from dlt.common.versioned_state import TVersionedState
 
@@ -66,15 +75,6 @@ class _StepInfo(NamedTuple):
     first_run: bool
     started_at: datetime.datetime
     finished_at: datetime.datetime
-
-
-class StepMetrics(TypedDict):
-    """Metrics for particular package processed in particular pipeline step"""
-
-    started_at: datetime.datetime
-    """Start of package processing"""
-    finished_at: datetime.datetime
-    """End of package processing"""
 
 
 TStepMetricsCo = TypeVar("TStepMetricsCo", bound=StepMetrics, covariant=True)
@@ -154,17 +154,20 @@ class StepInfo(SupportsHumanize, Generic[TStepMetricsCo]):
         return msg
 
     @staticmethod
-    def job_metrics_asdict(
+    def writer_metrics_asdict(
         job_metrics: Dict[str, DataWriterMetrics], key_name: str = "job_id", extend: StrAny = None
     ) -> List[DictStrAny]:
-        jobs = []
-        for job_id, metrics in job_metrics.items():
+        entities = []
+        for entity_id, metrics in job_metrics.items():
             d = metrics._asdict()
             if extend:
                 d.update(extend)
-            d[key_name] = job_id
-            jobs.append(d)
-        return jobs
+            d[key_name] = entity_id
+            # add job-level info if known
+            if metrics.file_path:
+                d["table_name"] = ParsedLoadJobFileName.parse(metrics.file_path).table_name
+            entities.append(d)
+        return entities
 
     def _astuple(self) -> _StepInfo:
         return _StepInfo(
@@ -175,25 +178,6 @@ class StepInfo(SupportsHumanize, Generic[TStepMetricsCo]):
             self.started_at,
             self.finished_at,
         )
-
-
-class ExtractDataInfo(TypedDict):
-    name: str
-    data_type: str
-
-
-class ExtractMetrics(StepMetrics):
-    schema_name: str
-    job_metrics: Dict[str, DataWriterMetrics]
-    """Metrics collected per job id during writing of job file"""
-    table_metrics: Dict[str, DataWriterMetrics]
-    """Job metrics aggregated by table"""
-    resource_metrics: Dict[str, DataWriterMetrics]
-    """Job metrics aggregated by resource"""
-    dag: List[Tuple[str, str]]
-    """A resource dag where elements of the list are graph edges"""
-    hints: Dict[str, Dict[str, Any]]
-    """Hints passed to the resources"""
 
 
 class _ExtractInfo(NamedTuple):
@@ -228,16 +212,8 @@ class ExtractInfo(StepInfo[ExtractMetrics], _ExtractInfo):  # type: ignore[misc]
         for load_id, metrics_list in self.metrics.items():
             for idx, metrics in enumerate(metrics_list):
                 extend = {"load_id": load_id, "extract_idx": idx}
-                load_metrics["job_metrics"].extend(
-                    self.job_metrics_asdict(metrics["job_metrics"], extend=extend)
-                )
-                load_metrics["table_metrics"].extend(
-                    self.job_metrics_asdict(
-                        metrics["table_metrics"], key_name="table_name", extend=extend
-                    )
-                )
                 load_metrics["resource_metrics"].extend(
-                    self.job_metrics_asdict(
+                    self.writer_metrics_asdict(
                         metrics["resource_metrics"], key_name="resource_name", extend=extend
                     )
                 )
@@ -253,18 +229,20 @@ class ExtractInfo(StepInfo[ExtractMetrics], _ExtractInfo):  # type: ignore[misc]
                         for name, hints in metrics["hints"].items()
                     ]
                 )
+                load_metrics["job_metrics"].extend(
+                    self.writer_metrics_asdict(metrics["job_metrics"], extend=extend)
+                )
+                load_metrics["table_metrics"].extend(
+                    self.writer_metrics_asdict(
+                        metrics["table_metrics"], key_name="table_name", extend=extend
+                    )
+                )
+
         d.update(load_metrics)
         return d
 
     def asstr(self, verbosity: int = 0) -> str:
         return self._load_packages_asstr(self.load_packages, verbosity)
-
-
-class NormalizeMetrics(StepMetrics):
-    job_metrics: Dict[str, DataWriterMetrics]
-    """Metrics collected per job id during writing of job file"""
-    table_metrics: Dict[str, DataWriterMetrics]
-    """Job metrics aggregated by table"""
 
 
 class _NormalizeInfo(NamedTuple):
@@ -305,10 +283,10 @@ class NormalizeInfo(StepInfo[NormalizeMetrics], _NormalizeInfo):  # type: ignore
             for idx, metrics in enumerate(metrics_list):
                 extend = {"load_id": load_id, "extract_idx": idx}
                 load_metrics["job_metrics"].extend(
-                    self.job_metrics_asdict(metrics["job_metrics"], extend=extend)
+                    self.writer_metrics_asdict(metrics["job_metrics"], extend=extend)
                 )
                 load_metrics["table_metrics"].extend(
-                    self.job_metrics_asdict(
+                    self.writer_metrics_asdict(
                         metrics["table_metrics"], key_name="table_name", extend=extend
                     )
                 )
@@ -324,10 +302,6 @@ class NormalizeInfo(StepInfo[NormalizeMetrics], _NormalizeInfo):  # type: ignore
             msg = "No data found to normalize"
         msg += self._load_packages_asstr(self.load_packages, verbosity)
         return msg
-
-
-class LoadMetrics(StepMetrics):
-    pass
 
 
 class _LoadInfo(NamedTuple):
@@ -354,7 +328,19 @@ class LoadInfo(StepInfo[LoadMetrics], _LoadInfo):  # type: ignore[misc]
 
     def asdict(self) -> DictStrAny:
         """A dictionary representation of LoadInfo that can be loaded with `dlt`"""
-        return super().asdict()
+        d = super().asdict()
+        # transform metrics
+        d.pop("metrics")
+        load_metrics: Dict[str, List[Any]] = {"job_metrics": []}
+        for load_id, metrics_list in self.metrics.items():
+            # one set of metrics per package id
+            assert len(metrics_list) == 1
+            metrics = metrics_list[0]
+            for job_metrics in metrics["job_metrics"].values():
+                load_metrics["job_metrics"].append({"load_id": load_id, **job_metrics._asdict()})
+
+        d.update(load_metrics)
+        return d
 
     def asstr(self, verbosity: int = 0) -> str:
         msg = f"Pipeline {self.pipeline.pipeline_name} load step completed in "
@@ -459,6 +445,8 @@ class TPipelineLocalState(TypedDict, total=False):
     """Timestamp indicating when the state was synced with the destination."""
     _last_extracted_hash: str
     """Hash of state that was recently synced with destination"""
+    initial_cwd: str
+    """Current working dir when pipeline was instantiated for a first time"""
 
 
 class TPipelineState(TVersionedState, total=False):
@@ -493,11 +481,11 @@ class SupportsPipeline(Protocol):
     """Name of the pipeline"""
     default_schema_name: str
     """Name of the default schema"""
-    destination: TDestination
+    destination: AnyDestination
     """The destination reference which is ModuleType. `destination.__name__` returns the name string"""
     dataset_name: str
     """Name of the dataset to which pipeline will be loaded to"""
-    runtime_config: RunConfiguration
+    runtime_config: RuntimeConfiguration
     """A configuration of runtime options like logging level and format and various tracing options"""
     working_dir: str
     """A working directory of the pipeline"""
@@ -561,9 +549,7 @@ class SupportsPipelineRun(Protocol):
 
 @configspec
 class PipelineContext(ContainerInjectableContext):
-    _deferred_pipeline: Callable[[], SupportsPipeline] = dataclasses.field(
-        default=None, init=False, repr=False, compare=False
-    )
+    _DEFERRED_PIPELINE: ClassVar[Callable[[], SupportsPipeline]] = None
     _pipeline: SupportsPipeline = dataclasses.field(
         default=None, init=False, repr=False, compare=False
     )
@@ -574,11 +560,11 @@ class PipelineContext(ContainerInjectableContext):
         """Creates or returns exiting pipeline"""
         if not self._pipeline:
             # delayed pipeline creation
-            assert self._deferred_pipeline is not None, (
+            assert PipelineContext._DEFERRED_PIPELINE is not None, (
                 "Deferred pipeline creation function not provided to PipelineContext. Are you"
                 " calling dlt.pipeline() from another thread?"
             )
-            self.activate(self._deferred_pipeline())
+            self.activate(PipelineContext._DEFERRED_PIPELINE())
         return self._pipeline
 
     def activate(self, pipeline: SupportsPipeline) -> None:
@@ -597,9 +583,10 @@ class PipelineContext(ContainerInjectableContext):
             self._pipeline._set_context(False)
         self._pipeline = None
 
-    def __init__(self, deferred_pipeline: Callable[..., SupportsPipeline] = None) -> None:
+    @classmethod
+    def cls__init__(self, deferred_pipeline: Callable[..., SupportsPipeline] = None) -> None:
         """Initialize the context with a function returning the Pipeline object to allow creation on first use"""
-        self._deferred_pipeline = deferred_pipeline
+        self._DEFERRED_PIPELINE = deferred_pipeline
 
 
 def current_pipeline() -> SupportsPipeline:
@@ -796,9 +783,38 @@ def get_dlt_pipelines_dir() -> str:
     2. if current user is root in /var/dlt/pipelines
     3. if current user does not have a home directory in /tmp/dlt/pipelines
     """
-    return os.path.join(get_dlt_data_dir(), "pipelines")
+    from dlt.common.runtime import run_context
+
+    return run_context.current().get_data_entity("pipelines")
 
 
 def get_dlt_repos_dir() -> str:
     """Gets default directory where command repositories will be stored"""
-    return os.path.join(get_dlt_data_dir(), "repos")
+    from dlt.common.runtime import run_context
+
+    return run_context.current().get_data_entity("repos")
+
+
+_CURRENT_PIPE_NAME: Dict[int, str] = {}
+"""Name of currently executing pipe per thread id set during execution of a gen in pipe"""
+
+
+def set_current_pipe_name(name: str) -> None:
+    """Set pipe name in current thread"""
+    _CURRENT_PIPE_NAME[threading.get_ident()] = name
+
+
+def unset_current_pipe_name() -> None:
+    """Unset pipe name in current thread"""
+    _CURRENT_PIPE_NAME[threading.get_ident()] = None
+
+
+def get_current_pipe_name() -> str:
+    """When executed from withing dlt.resource decorated function, gets pipe name associated with current thread.
+
+    Pipe name is the same as resource name for all currently known cases. In some multithreading cases, pipe name may be not available.
+    """
+    name = _CURRENT_PIPE_NAME.get(threading.get_ident())
+    if name is None:
+        raise ResourceNameNotAvailable()
+    return name

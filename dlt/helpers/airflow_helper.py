@@ -18,7 +18,7 @@ try:
     from airflow.configuration import conf
     from airflow.models import TaskInstance
     from airflow.utils.task_group import TaskGroup
-    from airflow.operators.dummy import DummyOperator  # type: ignore
+    from airflow.operators.dummy import DummyOperator
     from airflow.operators.python import PythonOperator, get_current_context
 except ModuleNotFoundError:
     raise MissingDependencyException("Airflow", ["apache-airflow>=2.5"])
@@ -35,7 +35,7 @@ from dlt.common.schema.typing import TWriteDispositionConfig, TSchemaContract
 from dlt.common.utils import uniq_id
 from dlt.common.normalizers.naming.snake_case import NamingConvention as SnakeCaseNamingConvention
 from dlt.common.configuration.container import Container
-from dlt.common.configuration.specs.config_providers_context import ConfigProvidersContext
+from dlt.common.configuration.specs.pluggable_run_context import PluggableRunContext
 from dlt.common.runtime.collector import NULL_COLLECTOR
 
 from dlt.extract import DltSource
@@ -66,8 +66,7 @@ class PipelineTasksGroup(TaskGroup):
         buffer_max_items: int = 1000,
         retry_policy: Retrying = DEFAULT_RETRY_NO_RETRY,
         retry_pipeline_steps: Sequence[TPipelineStep] = ("load",),
-        fail_task_if_any_job_failed: bool = True,
-        abort_task_if_any_job_failed: bool = False,
+        abort_task_if_any_job_failed: bool = True,
         wipe_local_data: bool = True,
         save_load_info: bool = False,
         save_trace_info: bool = False,
@@ -82,11 +81,7 @@ class PipelineTasksGroup(TaskGroup):
         The `data_folder` is available in certain Airflow deployments. In case of Composer, it is a location on the gcs bucket. `use_data_folder` is disabled and should be
         enabled only when needed. The operations on bucket are non-atomic and way slower than on local storage and should be avoided.
 
-        `fail_task_if_any_job_failed` will raise an exception if any of the loading jobs failed permanently and thus fail the current Airflow task.
-        This happens **after all dlt loading jobs executed**. See more here: https://dlthub.com/docs/running-in-production/running#failed-jobs
-
-        `abort_task_if_any_job_failed` will abort the other dlt loading jobs and fail the Airflow task in any of the jobs failed. This may put your warehouse in
-        inconsistent state so the option is disabled by default.
+        `abort_task_if_any_job_failed` will abort the other dlt loading jobs and fail the Airflow task in any of the jobs failed. See https://dlthub.com/docs/running-in-production/running#handle-exceptions-failed-jobs-and-retry-the-pipeline.
 
         The load info and trace info can be optionally saved to the destination. See https://dlthub.com/docs/running-in-production/running#inspect-and-save-the-load-info-and-trace
 
@@ -99,7 +94,6 @@ class PipelineTasksGroup(TaskGroup):
             buffer_max_items (int, optional): Maximum number of buffered items. Use 0 to keep dlt built-in limit. Defaults to 1000.
             retry_policy (_type_, optional): Tenacity retry policy. Defaults to no retry.
             retry_pipeline_steps (Sequence[TPipelineStep], optional): Which pipeline steps are eligible for retry. Defaults to ("load", ).
-            fail_task_if_any_job_failed (bool, optional): Will fail a task if any of the dlt load jobs failed. Defaults to True.
             wipe_local_data (bool, optional): Will wipe all the data created by pipeline, also in case of exception. Defaults to False.
             save_load_info (bool, optional): Will save extensive load info to the destination. Defaults to False.
             save_trace_info (bool, optional): Will save trace info to the destination. Defaults to False.
@@ -112,7 +106,6 @@ class PipelineTasksGroup(TaskGroup):
         self.buffer_max_items = buffer_max_items
         self.retry_policy = retry_policy
         self.retry_pipeline_steps = retry_pipeline_steps
-        self.fail_task_if_any_job_failed = fail_task_if_any_job_failed
         self.abort_task_if_any_job_failed = abort_task_if_any_job_failed
         self.wipe_local_data = wipe_local_data
         self.save_load_info = save_load_info
@@ -132,9 +125,9 @@ class PipelineTasksGroup(TaskGroup):
             data_dir = os.path.join(local_data_folder or gettempdir(), f"dlt_{uniq_id(8)}")
         os.environ[DLT_DATA_DIR] = data_dir
 
-        # delete existing config providers in container, they will get reloaded on next use
-        if ConfigProvidersContext in Container():
-            del Container()[ConfigProvidersContext]
+        # reload config providers
+        if PluggableRunContext in Container():
+            Container()[PluggableRunContext].reload_providers()
 
     def _task_name(self, pipeline: Pipeline, data: Any) -> str:
         """Generate a task name.
@@ -262,7 +255,7 @@ class PipelineTasksGroup(TaskGroup):
 
         # use task logger
         if self.use_task_logger:
-            ti: TaskInstance = get_current_context()["ti"]  # type: ignore
+            ti: TaskInstance = get_current_context()["ti"]  # type: ignore[assignment,unused-ignore]
             logger.LOGGER = ti.log
 
         # set global number of buffered items
@@ -270,10 +263,11 @@ class PipelineTasksGroup(TaskGroup):
             dlt.config["data_writer.buffer_max_items"] = self.buffer_max_items
             logger.info(f"Set data_writer.buffer_max_items to {self.buffer_max_items}")
 
-        # enable abort package if job failed
-        if self.abort_task_if_any_job_failed:
-            dlt.config["load.raise_on_failed_jobs"] = True
-            logger.info("Set load.abort_task_if_any_job_failed to True")
+        if self.abort_task_if_any_job_failed is not None:
+            dlt.config["load.raise_on_failed_jobs"] = self.abort_task_if_any_job_failed
+            logger.info(
+                "Set load.abort_task_if_any_job_failed to {self.abort_task_if_any_job_failed}"
+            )
 
         if self.log_progress_period > 0 and task_pipeline.collector == NULL_COLLECTOR:
             task_pipeline.collector = log(log_period=self.log_progress_period, logger=logger.LOGGER)
@@ -329,9 +323,7 @@ class PipelineTasksGroup(TaskGroup):
                             table_name="_trace",
                             loader_file_format=loader_file_format,
                         )
-                    # raise on failed jobs if requested
-                    if self.fail_task_if_any_job_failed:
-                        load_info.raise_on_failed_jobs()
+
         finally:
             # always completely wipe out pipeline folder, in case of success and failure
             if self.wipe_local_data:
@@ -404,7 +396,8 @@ class PipelineTasksGroup(TaskGroup):
         if not pipeline.pipelines_dir.startswith(os.environ[DLT_DATA_DIR]):
             raise ValueError(
                 "Please create your Pipeline instance after AirflowTasks are created. The dlt"
-                " pipelines directory is not set correctly."
+                f" pipelines directory {pipeline.pipelines_dir} is not set correctly"
+                f" ({os.environ[DLT_DATA_DIR]} expected)."
             )
 
         with self:

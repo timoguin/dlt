@@ -36,6 +36,10 @@ class DataItemNormalizer(abc.ABC, Generic[TNormalizerConfig]):
     def extend_table(self, table_name: str) -> None:
         pass
 
+    @abc.abstractmethod
+    def remove_table(self, table_name: str) -> None:
+        pass
+
     @classmethod
     @abc.abstractmethod
     def update_normalizer_config(cls, schema: Schema, config: TNormalizerConfig) -> None:
@@ -54,9 +58,9 @@ class SupportsDataItemNormalizer(Protocol):
     """A class with a name DataItemNormalizer deriving from normalizers.json.DataItemNormalizer"""
 
 
-def wrap_in_dict(item: Any) -> DictStrAny:
+def wrap_in_dict(label: str, item: Any) -> DictStrAny:
     """Wraps `item` that is not a dictionary into dictionary that can be json normalized"""
-    return {"value": item}
+    return {label: item}
 
 
 __all__ = [

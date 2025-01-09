@@ -3,7 +3,7 @@ from typing import Iterator
 import pytest
 
 from dlt.common.configuration.resolve import resolve_configuration
-from dlt.common.libs.sql_alchemy import make_url
+from dlt.common.libs.sql_alchemy_compat import make_url
 from dlt.common.utils import digest128
 from dlt.destinations.impl.clickhouse.clickhouse import ClickHouseClient
 from dlt.destinations.impl.clickhouse.configuration import (
@@ -56,7 +56,8 @@ def test_clickhouse_configuration() -> None:
 
 def test_clickhouse_connection_settings(client: ClickHouseClient) -> None:
     """Test experimental settings are set correctly for the session."""
-    conn = client.sql_client.open_connection()
+    # with client.sql_client.open_connection() as conn:
+    conn = client.sql_client.native_connection
     cursor1 = conn.cursor()
     cursor2 = conn.cursor()
 
@@ -69,3 +70,26 @@ def test_clickhouse_connection_settings(client: ClickHouseClient) -> None:
         assert ("allow_experimental_lightweight_delete", "1") in res
         assert ("enable_http_compression", "1") in res
         assert ("date_time_input_format", "best_effort") in res
+
+
+def test_client_has_dataset(client: ClickHouseClient) -> None:
+    # with client.sql_client as sql_client:
+    assert client.sql_client.has_dataset()
+    separator = client.config.dataset_table_separator
+
+    def _assert_has_dataset() -> None:
+        assert not client.sql_client.has_dataset()
+        client.sql_client.create_dataset()
+        assert client.sql_client.has_dataset()
+        client.sql_client.drop_dataset()
+        assert not client.sql_client.has_dataset()
+
+    try:
+        # change separator
+        client.config.dataset_table_separator = "_"
+        _assert_has_dataset()
+
+        client.config.dataset_table_separator = ""
+        _assert_has_dataset()
+    finally:
+        client.config.dataset_table_separator = separator

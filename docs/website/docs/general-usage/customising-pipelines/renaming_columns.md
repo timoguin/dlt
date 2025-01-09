@@ -8,9 +8,7 @@ keywords: [renaming, columns, special characters]
 
 ## Renaming columns by replacing the special characters
 
-In the example below, we create a dummy source with special characters in the name. We then write a
-function that we intend to apply to the resource to modify its output (i.e. replacing the German
-umlaut): `replace_umlauts_in_dict_keys`.
+In the example below, we create a dummy source with special characters in the name. We then write a function that we intend to apply to the resource to modify its output (i.e., replacing the German umlaut): `replace_umlauts_in_dict_keys`.
 
 ```py
 import dlt
@@ -41,15 +39,16 @@ def replace_umlauts_in_dict_keys(d):
 # We can add the map function to the resource
 
 # 1. Create an instance of the source so you can edit it.
-data_source = dummy_source()
+source_instance = dummy_source()
 
 # 2. Modify this source instance's resource
-data_resource = data_source.dummy_data().add_map(replace_umlauts_in_dict_keys)
+source_instance.dummy_data().add_map(replace_umlauts_in_dict_keys)
 
 # 3. Inspect your result
-for row in data_resource:
+for row in source_instance:
     print(row)
 
 # {'Objekt_0': {'Groesse': 0, 'Aequivalenzpruefung': True}}
 # ...
 ```
+

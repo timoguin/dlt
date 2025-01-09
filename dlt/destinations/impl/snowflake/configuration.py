@@ -4,7 +4,6 @@ from typing import Final, Optional, Any, Dict, ClassVar, List
 
 from dlt import version
 from dlt.common.data_writers.configuration import CsvFormatConfiguration
-from dlt.common.libs.sql_alchemy import URL
 from dlt.common.exceptions import MissingDependencyException
 from dlt.common.typing import TSecretStrValue
 from dlt.common.configuration.specs import ConnectionStringCredentials
@@ -56,9 +55,9 @@ SNOWFLAKE_APPLICATION_ID = "dltHub_dlt"
 @configspec(init=False)
 class SnowflakeCredentials(ConnectionStringCredentials):
     drivername: Final[str] = dataclasses.field(default="snowflake", init=False, repr=False, compare=False)  # type: ignore[misc]
-    password: Optional[TSecretStrValue] = None
     host: str = None
     database: str = None
+    username: str = None
     warehouse: Optional[str] = None
     role: Optional[str] = None
     authenticator: Optional[str] = None
@@ -138,6 +137,24 @@ class SnowflakeClientConfiguration(DestinationClientDwhWithStagingConfiguration)
 
     query_tag: Optional[str] = None
     """A tag with placeholders to tag sessions executing jobs"""
+
+    create_indexes: bool = False
+    """Whether UNIQUE or PRIMARY KEY constrains should be created"""
+
+    def __init__(
+        self,
+        *,
+        credentials: SnowflakeCredentials = None,
+        create_indexes: bool = False,
+        destination_name: str = None,
+        environment: str = None,
+    ) -> None:
+        super().__init__(
+            credentials=credentials,
+            destination_name=destination_name,
+            environment=environment,
+        )
+        self.create_indexes = create_indexes
 
     def fingerprint(self) -> str:
         """Returns a fingerprint of host part of a connection string"""

@@ -20,7 +20,7 @@ from collections.abc import Mapping as C_Mapping
 import yaml
 
 from dlt.common.json import json
-from dlt.common.typing import AnyType, DictStrAny, TAny
+from dlt.common.typing import AnyType, DictStrAny, TAny, is_any_type
 from dlt.common.data_types import coerce_value, py_type_to_sc_type
 from dlt.common.configuration.providers import EnvironProvider
 from dlt.common.configuration.exceptions import ConfigValueCannotBeCoercedException, LookupTrace
@@ -45,7 +45,7 @@ _RESOLVED_TRACES: Dict[str, ResolvedValueTrace] = {}  # stores all the resolved 
 
 def deserialize_value(key: str, value: Any, hint: Type[TAny]) -> TAny:
     try:
-        if hint != Any:
+        if not is_any_type(hint):
             # if deserializing to base configuration, try parse the value
             if is_base_configuration_inner_hint(hint):
                 c = hint()
@@ -77,8 +77,8 @@ def deserialize_value(key: str, value: Any, hint: Type[TAny]) -> TAny:
             hint_dt = py_type_to_sc_type(hint_origin)
             value_dt = py_type_to_sc_type(type(value))
 
-            # eval only if value is string and hint is "complex"
-            if value_dt == "text" and hint_dt == "complex":
+            # eval only if value is string and hint is "json"
+            if value_dt == "text" and hint_dt == "json":
                 if hint_origin is tuple:
                     # use literal eval for tuples
                     value = ast.literal_eval(value)
@@ -89,7 +89,7 @@ def deserialize_value(key: str, value: Any, hint: Type[TAny]) -> TAny:
                 if not isinstance(value, hint_origin):
                     raise ValueError(value)
             else:
-                # for types that are not complex, reuse schema coercion rules
+                # for types that are not nested, reuse schema coercion rules
                 if value_dt != hint_dt:
                     value = coerce_value(hint_dt, value_dt, value)
                 if literal_values and value not in literal_values:
@@ -119,7 +119,7 @@ def serialize_value(value: Any) -> str:
 
 
 def auto_cast(value: str) -> Any:
-    """Parse and cast str `value` to bool, int, float and complex (via JSON)
+    """Parse and cast str `value` to bool, int, float and json
 
     F[f]alse and T[t]rue strings are cast to bool values
     """
@@ -228,4 +228,6 @@ def add_config_dict_to_env(
                         destructure_dicts=destructure_dicts,
                     )
                 else:
-                    os.environ[env_key] = serialize_value(v)
+                    # skip non-serializable fields
+                    with contextlib.suppress(TypeError):
+                        os.environ[env_key] = serialize_value(v)

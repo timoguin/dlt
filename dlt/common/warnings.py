@@ -6,7 +6,7 @@ import typing_extensions
 
 from dlt.version import __version__
 
-VersionString = typing.Union[str, semver.VersionInfo]
+VersionString = typing.Union[str, semver.Version]
 
 
 class DltDeprecationWarning(DeprecationWarning):
@@ -30,16 +30,15 @@ class DltDeprecationWarning(DeprecationWarning):
     ) -> None:
         super().__init__(message, *args)
         self.message = message.rstrip(".")
-        self.since = (
-            since if isinstance(since, semver.VersionInfo) else semver.parse_version_info(since)
-        )
+        self.since = since if isinstance(since, semver.Version) else semver.Version.parse(since)
         if expected_due:
             expected_due = (
                 expected_due
-                if isinstance(expected_due, semver.VersionInfo)
-                else semver.parse_version_info(expected_due)
+                if isinstance(expected_due, semver.Version)
+                else semver.Version.parse(expected_due)
             )
-        self.expected_due = expected_due if expected_due is not None else self.since.bump_minor()
+        # we deprecate across major version since 1.0.0
+        self.expected_due = expected_due if expected_due is not None else self.since.bump_major()
 
     def __str__(self) -> str:
         message = (
@@ -49,11 +48,20 @@ class DltDeprecationWarning(DeprecationWarning):
 
 
 class Dlt04DeprecationWarning(DltDeprecationWarning):
-    V04 = semver.parse_version_info("0.4.0")
+    V04 = semver.Version.parse("0.4.0")
 
     def __init__(self, message: str, *args: typing.Any, expected_due: VersionString = None) -> None:
         super().__init__(
             message, *args, since=Dlt04DeprecationWarning.V04, expected_due=expected_due
+        )
+
+
+class Dlt100DeprecationWarning(DltDeprecationWarning):
+    V100 = semver.Version.parse("1.0.0")
+
+    def __init__(self, message: str, *args: typing.Any, expected_due: VersionString = None) -> None:
+        super().__init__(
+            message, *args, since=Dlt100DeprecationWarning.V100, expected_due=expected_due
         )
 
 

@@ -1,4 +1,6 @@
 import itertools
+import time
+
 from typing import Iterator
 
 import pytest
@@ -6,6 +8,7 @@ import asyncio
 
 import dlt, os
 from dlt.common.configuration.container import Container
+from dlt.common.configuration.specs import BaseConfiguration
 from dlt.common.exceptions import DictValidationException, PipelineStateNotAvailable
 from dlt.common.pipeline import StateInjectableContext, source_state
 from dlt.common.schema import Schema
@@ -836,7 +839,7 @@ def test_limit_infinite_counter() -> None:
 
 @pytest.mark.parametrize("limit", (None, -1, 0, 10))
 def test_limit_edge_cases(limit: int) -> None:
-    r = dlt.resource(range(20), name="infinity").add_limit(limit)  # type: ignore
+    r = dlt.resource(range(20), name="resource").add_limit(limit)  # type: ignore
 
     @dlt.resource()
     async def r_async():
@@ -844,20 +847,60 @@ def test_limit_edge_cases(limit: int) -> None:
             await asyncio.sleep(0.01)
             yield i
 
+    @dlt.resource(parallelized=True)
+    def parallelized_resource():
+        for i in range(20):
+            yield i
+
     sync_list = list(r)
     async_list = list(r_async().add_limit(limit))
+    parallelized_list = list(parallelized_resource().add_limit(limit))
+
+    # all lists should be the same
+    assert sync_list == async_list == parallelized_list
 
     if limit == 10:
         assert sync_list == list(range(10))
-        # we have edge cases where the async list will have one extra item
-        # possibly due to timing issues, maybe some other implementation problem
-        assert (async_list == list(range(10))) or (async_list == list(range(11)))
     elif limit in [None, -1]:
-        assert sync_list == async_list == list(range(20))
+        assert sync_list == list(range(20))
     elif limit == 0:
-        assert sync_list == async_list == []
+        assert sync_list == []
     else:
         raise AssertionError(f"Unexpected limit: {limit}")
+
+
+def test_various_limit_setups() -> None:
+    # basic test
+    r = dlt.resource([1, 2, 3, 4, 5], name="test").add_limit(3)
+    assert list(r) == [1, 2, 3]
+
+    # yield map test
+    r = (
+        dlt.resource([1, 2, 3, 4, 5], name="test")
+        .add_map(lambda i: str(i) * i, 1)
+        .add_yield_map(lambda i: (yield from i))
+        .add_limit(3)
+    )
+    # limit is applied at the end
+    assert list(r) == ["1", "2", "2"]  # "3" ,"3" ,"3" ,"4" ,"4" ,"4" ,"4", ...]
+
+    # nested lists test (limit only applied to yields, not actual items)
+    r = dlt.resource([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]], name="test").add_limit(3)
+    assert list(r) == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    # transformer test
+    r = dlt.resource([1, 2, 3, 4, 5], name="test").add_limit(4)
+    t = dlt.transformer(lambda i: i * 2, name="test")
+    assert list(r) == [1, 2, 3, 4]
+    assert list(r | t) == [2, 4, 6, 8]
+
+    # adding limit to transformer is disregarded
+    t = t.add_limit(2)
+    assert list(r | t) == [2, 4, 6, 8]
+
+    # limits are fully replaced (more genereous limit applied later takes precedence)
+    r = dlt.resource([1, 2, 3, 4, 5], name="test").add_limit(3).add_limit(4)
+    assert list(r) == [1, 2, 3, 4]
 
 
 def test_limit_source() -> None:
@@ -873,6 +916,30 @@ def test_limit_source() -> None:
 
     # transformer is not limited to 2 elements, infinite resource is, we have 3 resources
     assert list(infinite_source().add_limit(2)) == ["A", "A", 0, "A", "A", "A", 1] * 3
+
+
+def test_limit_max_time() -> None:
+    @dlt.resource()
+    def r():
+        for i in range(100):
+            time.sleep(0.1)
+            yield i
+
+    @dlt.resource()
+    async def r_async():
+        for i in range(100):
+            await asyncio.sleep(0.1)
+            yield i
+
+    sync_list = list(r().add_limit(max_time=1))
+    async_list = list(r_async().add_limit(max_time=1))
+
+    # we should have extracted 10 items within 1 second, sleep is included in the resource
+    # we allow for some variance in the number of items, as the sleep is not super precise
+    # on mac os we even sometimes just get 4 items...
+    allowed_results = [list(range(i)) for i in [12, 11, 10, 9, 8, 7, 6, 5, 4]]
+    assert sync_list in allowed_results
+    assert async_list in allowed_results
 
 
 def test_source_state() -> None:
@@ -1102,6 +1169,21 @@ def test_clone_resource_on_bind():
     assert bound_pipe is pipe is multiplier
     assert bound_pipe._pipe is pipe._pipe
     assert bound_pipe._pipe.parent is pipe._pipe.parent
+
+
+@dlt.resource(selected=False)
+def number_gen_ext(max_r=3):
+    yield from range(1, max_r)
+
+
+def test_clone_resource_with_rename():
+    assert number_gen_ext.SPEC is not BaseConfiguration
+    gene_r = number_gen_ext.with_name("gene")
+    assert number_gen_ext.name == "number_gen_ext"
+    assert gene_r.name == "gene"
+    assert number_gen_ext.section == gene_r.section
+    assert gene_r.SPEC is number_gen_ext.SPEC
+    assert gene_r.selected == number_gen_ext.selected is False
 
 
 def test_source_multiple_iterations() -> None:
@@ -1354,15 +1436,15 @@ def test_apply_hints() -> None:
     # combine columns with primary key
     empty_r = empty()
     empty_r.apply_hints(
-        columns={"tags": {"data_type": "complex", "primary_key": False}},
+        columns={"tags": {"data_type": "json", "primary_key": False}},
         primary_key="tags",
         merge_key="tags",
     )
     # primary key not set here
-    assert empty_r.columns["tags"] == {"data_type": "complex", "name": "tags", "primary_key": False}
+    assert empty_r.columns["tags"] == {"data_type": "json", "name": "tags", "primary_key": False}
     # only in the computed table
     assert empty_r.compute_table_schema()["columns"]["tags"] == {
-        "data_type": "complex",
+        "data_type": "json",
         "name": "tags",
         "nullable": False,  # NOT NULL because `tags` do not define it
         "primary_key": True,
@@ -1390,6 +1472,45 @@ def test_apply_hints() -> None:
     assert "x-valid-from" in table["columns"]["from"]
     assert "to" in table["columns"]
     assert "x-valid-to" in table["columns"]["to"]
+
+    # Test table references hint
+    reference_hint = [
+        dict(
+            referenced_table="other_table",
+            columns=["a", "b"],
+            referenced_columns=["other_a", "other_b"],
+        )
+    ]
+    empty_r.apply_hints(references=reference_hint)
+    assert empty_r._hints["references"] == reference_hint
+    table = empty_r.compute_table_schema()
+    assert table["references"] == reference_hint
+
+    # Apply references again, list is extended
+    reference_hint_2 = [
+        dict(
+            referenced_table="other_table_2",
+            columns=["c", "d"],
+            referenced_columns=["other_c", "other_d"],
+        )
+    ]
+    empty_r.apply_hints(references=reference_hint_2)
+    assert empty_r._hints["references"] == reference_hint + reference_hint_2
+    table = empty_r.compute_table_schema()
+    assert table["references"] == reference_hint + reference_hint_2
+
+    # Duplicate reference is replaced
+    reference_hint_3 = [
+        dict(
+            referenced_table="other_table",
+            columns=["a2", "b2"],
+            referenced_columns=["other_a2", "other_b2"],
+        )
+    ]
+    empty_r.apply_hints(references=reference_hint_3)
+    assert empty_r._hints["references"] == reference_hint_3 + reference_hint_2
+    table = empty_r.compute_table_schema()
+    assert table["references"] == reference_hint_3 + reference_hint_2
 
 
 def test_apply_dynamic_hints() -> None:
@@ -1434,6 +1555,36 @@ def test_apply_dynamic_hints() -> None:
         {"t": "table", "p": "parent", "pk": ["a", "b"], "wd": "skip", "c": [{"name": "tags"}]}
     )
     assert table["columns"]["tags"] == {"name": "tags"}
+
+
+def test_apply_hints_complex_migration() -> None:
+    def empty_gen():
+        yield [1, 2, 3]
+
+    empty = DltResource.from_data(empty_gen)
+    empty_r = empty()
+
+    def dyn_type(ev):
+        # must return columns in one of the known formats
+        return [{"name": "dyn_col", "data_type": ev["dt"]}]
+
+    # start with static columns, update to dynamic
+    empty_r.apply_hints(
+        table_name=lambda ev: ev["t"], columns=[{"name": "dyn_col", "data_type": "json"}]
+    )
+
+    table = empty_r.compute_table_schema({"t": "table"})
+    assert table["columns"]["dyn_col"]["data_type"] == "json"
+
+    empty_r.apply_hints(table_name=lambda ev: ev["t"], columns=dyn_type)
+    table = empty_r.compute_table_schema({"t": "table", "dt": "complex"})
+    assert table["columns"]["dyn_col"]["data_type"] == "json"
+
+    # start with dynamic
+    empty_r = empty()
+    empty_r.apply_hints(table_name=lambda ev: ev["t"], columns=dyn_type)
+    table = empty_r.compute_table_schema({"t": "table", "dt": "complex"})
+    assert table["columns"]["dyn_col"]["data_type"] == "json"
 
 
 def test_apply_hints_table_variants() -> None:

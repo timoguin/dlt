@@ -4,33 +4,52 @@ import os
 import yaml
 import posixpath
 from pathlib import Path
-from typing import Dict, NamedTuple, Sequence, Tuple, TypedDict, List
+from typing import Dict, NamedTuple, Sequence, Tuple, List, Literal
 from dlt.cli.exceptions import VerifiedSourceRepoError
 
 from dlt.common import git
-from dlt.common.configuration.paths import make_dlt_settings_path
 from dlt.common.storages import FileStorage
+from dlt.common.typing import TypedDict
 
 from dlt.common.reflection.utils import get_module_docstring
 
 from dlt.cli import utils
 from dlt.cli.requirements import SourceRequirements
 
+TSourceType = Literal["core", "verified", "template"]
 
 SOURCES_INIT_INFO_ENGINE_VERSION = 1
+
+SOURCES_MODULE_NAME = "sources"
+CORE_SOURCE_TEMPLATE_MODULE_NAME = "_core_source_templates"
+SINGLE_FILE_TEMPLATE_MODULE_NAME = "_single_file_templates"
+
 SOURCES_INIT_INFO_FILE = ".sources"
 IGNORE_FILES = ["*.py[cod]", "*$py.class", "__pycache__", "py.typed", "requirements.txt"]
-IGNORE_SOURCES = [".*", "_*"]
+IGNORE_VERIFIED_SOURCES = [".*", "_*"]
+IGNORE_CORE_SOURCES = [
+    ".*",
+    "_*",
+    "helpers",
+    SINGLE_FILE_TEMPLATE_MODULE_NAME,
+    CORE_SOURCE_TEMPLATE_MODULE_NAME,
+]
+PIPELINE_FILE_SUFFIX = "_pipeline.py"
+# hardcode default template files here
+TEMPLATE_FILES = [".gitignore", ".dlt/config.toml"]
+DEFAULT_PIPELINE_TEMPLATE = "default_pipeline.py"
 
 
-class VerifiedSourceFiles(NamedTuple):
-    is_template: bool
+class SourceConfiguration(NamedTuple):
+    source_type: TSourceType
+    source_module_prefix: str
     storage: FileStorage
-    pipeline_script: str
+    src_pipeline_script: str
     dest_pipeline_script: str
     files: List[str]
     requirements: SourceRequirements
     doc: str
+    is_default_template: bool
 
 
 class TVerifiedSourceFileEntry(TypedDict):
@@ -53,13 +72,13 @@ class TVerifiedSourcesFileIndex(TypedDict):
 
 
 def _save_dot_sources(index: TVerifiedSourcesFileIndex) -> None:
-    with open(make_dlt_settings_path(SOURCES_INIT_INFO_FILE), "w", encoding="utf-8") as f:
+    with open(utils.make_dlt_settings_path(SOURCES_INIT_INFO_FILE), "w", encoding="utf-8") as f:
         yaml.dump(index, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
 
 def _load_dot_sources() -> TVerifiedSourcesFileIndex:
     try:
-        with open(make_dlt_settings_path(SOURCES_INIT_INFO_FILE), "r", encoding="utf-8") as f:
+        with open(utils.make_dlt_settings_path(SOURCES_INIT_INFO_FILE), "r", encoding="utf-8") as f:
             index: TVerifiedSourcesFileIndex = yaml.safe_load(f)
             if not index:
                 raise FileNotFoundError(SOURCES_INIT_INFO_FILE)
@@ -147,34 +166,69 @@ def get_remote_source_index(
         }
 
 
-def get_verified_source_names(sources_storage: FileStorage) -> List[str]:
+def get_sources_names(sources_storage: FileStorage, source_type: TSourceType) -> List[str]:
     candidates: List[str] = []
-    for name in [
-        n
-        for n in sources_storage.list_folder_dirs(".", to_root=False)
-        if not any(fnmatch.fnmatch(n, ignore) for ignore in IGNORE_SOURCES)
-    ]:
-        # must contain at least one valid python script
-        if any(f.endswith(".py") for f in sources_storage.list_folder_files(name, to_root=False)):
-            candidates.append(name)
+
+    # for the templates we just find all the filenames
+    if source_type == "template":
+        for name in sources_storage.list_folder_files(".", to_root=False):
+            if name.endswith(PIPELINE_FILE_SUFFIX):
+                candidates.append(name.replace(PIPELINE_FILE_SUFFIX, ""))
+    else:
+        ignore_cases = IGNORE_VERIFIED_SOURCES if source_type == "verified" else IGNORE_CORE_SOURCES
+        for name in [
+            n
+            for n in sources_storage.list_folder_dirs(".", to_root=False)
+            if not any(fnmatch.fnmatch(n, ignore) for ignore in ignore_cases)
+        ]:
+            # must contain at least one valid python script
+            if any(
+                f.endswith(".py") for f in sources_storage.list_folder_files(name, to_root=False)
+            ):
+                candidates.append(name)
+
+    candidates.sort()
     return candidates
 
 
-def get_verified_source_files(
+def _get_docstring_for_module(sources_storage: FileStorage, source_name: str) -> str:
+    # read the docs
+    init_py = os.path.join(source_name, utils.MODULE_INIT)
+    docstring: str = ""
+    if sources_storage.has_file(init_py):
+        docstring = get_module_docstring(sources_storage.load(init_py))
+        if docstring:
+            docstring = docstring.splitlines()[0]
+    return docstring
+
+
+def get_template_configuration(
     sources_storage: FileStorage, source_name: str
-) -> VerifiedSourceFiles:
-    if not sources_storage.has_folder(source_name):
-        raise VerifiedSourceRepoError(
-            f"Verified source {source_name} could not be found in the repository", source_name
-        )
-    # find example script
-    example_script = f"{source_name}_pipeline.py"
-    if not sources_storage.has_file(example_script):
-        raise VerifiedSourceRepoError(
-            f"Pipeline example script {example_script} could not be found in the repository",
-            source_name,
-        )
-    # get all files recursively
+) -> SourceConfiguration:
+    destination_pipeline_file_name = source_name + PIPELINE_FILE_SUFFIX
+    source_pipeline_file_name = destination_pipeline_file_name
+
+    if not sources_storage.has_file(source_pipeline_file_name):
+        source_pipeline_file_name = DEFAULT_PIPELINE_TEMPLATE
+
+    docstring = get_module_docstring(sources_storage.load(source_pipeline_file_name))
+    if docstring:
+        docstring = docstring.splitlines()[0]
+    return SourceConfiguration(
+        "template",
+        source_pipeline_file_name.replace("pipeline.py", ""),
+        sources_storage,
+        source_pipeline_file_name,
+        destination_pipeline_file_name,
+        [],
+        SourceRequirements([]),
+        docstring,
+        source_pipeline_file_name == DEFAULT_PIPELINE_TEMPLATE,
+    )
+
+
+def _get_source_files(sources_storage: FileStorage, source_name: str) -> List[str]:
+    """Get all files that belong to source `source_name`"""
     files: List[str] = []
     for root, subdirs, _files in os.walk(sources_storage.make_full_path(source_name)):
         # filter unwanted files
@@ -189,13 +243,44 @@ def get_verified_source_files(
                 if all(not fnmatch.fnmatch(file, ignore) for ignore in IGNORE_FILES)
             ]
         )
-    # read the docs
-    init_py = os.path.join(source_name, utils.MODULE_INIT)
-    docstring: str = ""
-    if sources_storage.has_file(init_py):
-        docstring = get_module_docstring(sources_storage.load(init_py))
-        if docstring:
-            docstring = docstring.splitlines()[0]
+    return files
+
+
+def get_core_source_configuration(
+    sources_storage: FileStorage, source_name: str, eject_source: bool
+) -> SourceConfiguration:
+    src_pipeline_file = CORE_SOURCE_TEMPLATE_MODULE_NAME + "/" + source_name + PIPELINE_FILE_SUFFIX
+    dest_pipeline_file = source_name + PIPELINE_FILE_SUFFIX
+    files: List[str] = _get_source_files(sources_storage, source_name) if eject_source else []
+
+    return SourceConfiguration(
+        "core",
+        "dlt.sources." + source_name,
+        sources_storage,
+        src_pipeline_file,
+        dest_pipeline_file,
+        files,
+        SourceRequirements([]),
+        _get_docstring_for_module(sources_storage, source_name),
+        False,
+    )
+
+
+def get_verified_source_configuration(
+    sources_storage: FileStorage, source_name: str
+) -> SourceConfiguration:
+    if not sources_storage.has_folder(source_name):
+        raise VerifiedSourceRepoError(
+            f"Verified source {source_name} could not be found in the repository", source_name
+        )
+    # find example script
+    example_script = f"{source_name}{PIPELINE_FILE_SUFFIX}"
+    if not sources_storage.has_file(example_script):
+        raise VerifiedSourceRepoError(
+            f"Pipeline example script {example_script} could not be found in the repository",
+            source_name,
+        )
+    files = _get_source_files(sources_storage, source_name)
     # read requirements
     requirements_path = os.path.join(source_name, utils.REQUIREMENTS_TXT)
     if sources_storage.has_file(requirements_path):
@@ -203,8 +288,16 @@ def get_verified_source_files(
     else:
         requirements = SourceRequirements([])
     # find requirements
-    return VerifiedSourceFiles(
-        False, sources_storage, example_script, example_script, files, requirements, docstring
+    return SourceConfiguration(
+        "verified",
+        source_name,
+        sources_storage,
+        example_script,
+        example_script,
+        files,
+        requirements,
+        _get_docstring_for_module(sources_storage, source_name),
+        False,
     )
 
 

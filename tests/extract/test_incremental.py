@@ -1,46 +1,53 @@
-import os
 import asyncio
 import inspect
+import os
 import random
-from time import sleep
-from typing import Optional, Any
-from unittest import mock
-from datetime import datetime  # noqa: I251
+from datetime import datetime, date  # noqa: I251
 from itertools import chain, count
+from time import sleep
+from typing import Any, Optional, Literal, Sequence, Dict, Iterable
+from unittest import mock
+import itertools
 
 import duckdb
+import pyarrow as pa
 import pytest
 
 import dlt
+from dlt.common import Decimal
+from dlt.common.configuration import ConfigurationValueError
 from dlt.common.configuration.container import Container
 from dlt.common.configuration.exceptions import InvalidNativeValue
-from dlt.common.configuration.specs.base_configuration import configspec, BaseConfiguration
-from dlt.common.configuration import ConfigurationValueError
+from dlt.common.configuration.specs.base_configuration import (
+    BaseConfiguration,
+    configspec,
+)
+from dlt.common.json import json
 from dlt.common.pendulum import pendulum, timedelta
-from dlt.common import Decimal
 from dlt.common.pipeline import NormalizeInfo, StateInjectableContext, resource_state
 from dlt.common.schema.schema import Schema
-from dlt.common.utils import uniq_id, digest128, chunks
-from dlt.common.json import json
-
+from dlt.common.utils import chunks, digest128, uniq_id
 from dlt.extract import DltSource
-from dlt.extract.exceptions import InvalidStepFunctionArguments
-from dlt.extract.items import ValidateItem
-from dlt.extract.resource import DltResource
-from dlt.sources.helpers.transform import take_first
-from dlt.extract.incremental import IncrementalResourceWrapper, Incremental
+from dlt.extract.incremental import Incremental, IncrementalResourceWrapper
 from dlt.extract.incremental.exceptions import (
+    IncrementalCursorInvalidCoercion,
+    IncrementalCursorPathHasValueNone,
     IncrementalCursorPathMissing,
     IncrementalPrimaryKeyMissing,
 )
+from dlt.extract.incremental.lag import apply_lag
+from dlt.extract.items_transform import ValidateItem
+from dlt.extract.resource import DltResource
 from dlt.pipeline.exceptions import PipelineStepFailed
+from dlt.sources.helpers.transform import take_first
 
 from tests.extract.utils import AssertItems, data_item_to_list
+from tests.pipeline.utils import assert_query_data
 from tests.utils import (
+    ALL_TEST_DATA_ITEM_FORMATS,
+    TestDataItemFormat,
     data_item_length,
     data_to_item_format,
-    TestDataItemFormat,
-    ALL_TEST_DATA_ITEM_FORMATS,
 )
 
 
@@ -166,8 +173,9 @@ def test_last_value_access_in_resource(item_type: TestDataItemFormat) -> None:
 
     p = dlt.pipeline(pipeline_name=uniq_id())
     p.extract(some_data())
-    p.extract(some_data())
+    assert values == [None]
 
+    p.extract(some_data())
     assert values == [None, 5]
 
 
@@ -202,8 +210,8 @@ def test_unique_keys_are_deduplicated(item_type: TestDataItemFormat) -> None:
         pipeline_name=uniq_id(),
         destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:")),
     )
-    p.run(some_data()).raise_on_failed_jobs()
-    p.run(some_data()).raise_on_failed_jobs()
+    p.run(some_data())
+    p.run(some_data())
 
     with p.sql_client() as c:
         with c.execute_query("SELECT created_at, id FROM some_data order by created_at, id") as cur:
@@ -212,8 +220,74 @@ def test_unique_keys_are_deduplicated(item_type: TestDataItemFormat) -> None:
     assert rows == [(1, "a"), (2, "b"), (3, "c"), (3, "d"), (3, "e"), (3, "f"), (4, "g")]
 
 
+def test_pandas_index_as_dedup_key() -> None:
+    from dlt.common.libs.pandas import pandas_to_arrow, pandas as pd
+
+    some_data, p = _make_dedup_pipeline("pandas")
+
+    # no index
+    no_index_r = some_data.with_name(new_name="no_index")
+    p.run(no_index_r)
+    p.run(no_index_r)
+    data_ = p.dataset().no_index.arrow()
+    assert data_.schema.names == ["created_at", "id"]
+    assert data_["id"].to_pylist() == ["a", "b", "c", "d", "e", "f", "g"]
+
+    # unnamed index: explicitly converted
+    unnamed_index_r = some_data.with_name(new_name="unnamed_index").add_map(
+        lambda df: pandas_to_arrow(df, preserve_index=True)
+    )
+    # use it (as in arrow table) to deduplicate
+    unnamed_index_r.incremental.primary_key = "__index_level_0__"
+    p.run(unnamed_index_r)
+    p.run(unnamed_index_r)
+    data_ = p.dataset().unnamed_index.arrow()
+    assert data_.schema.names == ["created_at", "id", "index_level_0"]
+    # indexes 2 and 3 are removed from second batch because they were in the previous batch
+    # and the created_at overlapped so they got deduplicated
+    assert data_["index_level_0"].to_pylist() == [0, 1, 2, 3, 4, 0, 1, 4]
+
+    def _make_named_index(df_: pd.DataFrame) -> pd.DataFrame:
+        df_.index = pd.RangeIndex(start=0, stop=len(df_), step=1, name="order_id")
+        return df_
+
+    # named index explicitly converted
+    named_index_r = some_data.with_name(new_name="named_index").add_map(
+        lambda df: pandas_to_arrow(_make_named_index(df), preserve_index=True)
+    )
+    # use it (as in arrow table) to deduplicate
+    named_index_r.incremental.primary_key = "order_id"
+    p.run(named_index_r)
+    p.run(named_index_r)
+    data_ = p.dataset().named_index.arrow()
+    assert data_.schema.names == ["created_at", "id", "order_id"]
+    assert data_["order_id"].to_pylist() == [0, 1, 2, 3, 4, 0, 1, 4]
+
+    # named index explicitly converted
+    named_index_impl_r = some_data.with_name(new_name="named_index_impl").add_map(
+        lambda df: _make_named_index(df)
+    )
+    p.run(named_index_impl_r)
+    p.run(named_index_impl_r)
+    data_ = p.dataset().named_index_impl.arrow()
+    assert data_.schema.names == ["created_at", "id"]
+    assert data_["id"].to_pylist() == ["a", "b", "c", "d", "e", "f", "g"]
+
+
 @pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
 def test_unique_rows_by_hash_are_deduplicated(item_type: TestDataItemFormat) -> None:
+    some_data, p = _make_dedup_pipeline(item_type)
+    p.run(some_data())
+    p.run(some_data())
+
+    with p.sql_client() as c:
+        with c.execute_query("SELECT created_at, id FROM some_data ORDER BY created_at, id") as cur:
+            rows = cur.fetchall()
+    print(rows)
+    assert rows == [(1, "a"), (2, "b"), (3, "c"), (3, "d"), (3, "e"), (3, "f"), (4, "g")]
+
+
+def _make_dedup_pipeline(item_type: TestDataItemFormat):
     data1 = [
         {"created_at": 1, "id": "a"},
         {"created_at": 2, "id": "b"},
@@ -228,7 +302,6 @@ def test_unique_rows_by_hash_are_deduplicated(item_type: TestDataItemFormat) -> 
         {"created_at": 3, "id": "f"},
         {"created_at": 4, "id": "g"},
     ]
-
     source_items1 = data_to_item_format(item_type, data1)
     source_items2 = data_to_item_format(item_type, data2)
 
@@ -243,14 +316,7 @@ def test_unique_rows_by_hash_are_deduplicated(item_type: TestDataItemFormat) -> 
         pipeline_name=uniq_id(),
         destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:")),
     )
-    p.run(some_data()).raise_on_failed_jobs()
-    p.run(some_data()).raise_on_failed_jobs()
-
-    with p.sql_client() as c:
-        with c.execute_query("SELECT created_at, id FROM some_data order by created_at, id") as cur:
-            rows = cur.fetchall()
-
-    assert rows == [(1, "a"), (2, "b"), (3, "c"), (3, "d"), (3, "e"), (3, "f"), (4, "g")]
+    return some_data, p
 
 
 def test_nested_cursor_path() -> None:
@@ -450,7 +516,7 @@ def test_composite_primary_key(item_type: TestDataItemFormat) -> None:
         pipeline_name=uniq_id(),
         destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:")),
     )
-    p.run(some_data()).raise_on_failed_jobs()
+    p.run(some_data())
 
     with p.sql_client() as c:
         with c.execute_query(
@@ -538,6 +604,39 @@ def test_cursor_datetime_type(item_type: TestDataItemFormat) -> None:
         "created_at"
     ]
     assert s["last_value"] == initial_value + timedelta(minutes=4)
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_incremental_transform_return_empty_rows_with_lag(item_type: TestDataItemFormat) -> None:
+    @dlt.resource
+    def some_data(
+        created_at=dlt.sources.incremental(
+            "created_at", initial_value="2024-11-01T08:00:00+08:00", lag=3600
+        )
+    ):
+        yield from source_items
+
+    p = dlt.pipeline(pipeline_name=uniq_id())
+
+    first_run_data = [{"id": 1, "value": 10, "created_at": "2024-11-01T12:00:00+08:00"}]
+    source_items = data_to_item_format(item_type, first_run_data)
+
+    p.extract(some_data())
+    s = p.state["sources"][p.default_schema_name]["resources"]["some_data"]["incremental"][
+        "created_at"
+    ]
+
+    assert s["last_value"] == "2024-11-01T12:00:00+08:00"
+
+    second_run_data = [{"id": 1, "value": 10, "created_at": "2024-11-01T10:00:00+08:00"}]
+    source_items = data_to_item_format(item_type, second_run_data)
+
+    p.extract(some_data())
+    s = p.state["sources"][p.default_schema_name]["resources"]["some_data"]["incremental"][
+        "created_at"
+    ]
+
+    assert s["last_value"] == "2024-11-01T12:00:00+08:00"
 
 
 @pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
@@ -632,6 +731,508 @@ def test_missing_cursor_field(item_type: TestDataItemFormat) -> None:
         dlt.run(some_data(), destination="dummy")
     assert isinstance(pip_ex.value.__context__, IncrementalCursorPathMissing)
     assert pip_ex.value.__context__.json_path == "item.timestamp"
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_cursor_path_none_includes_records_and_updates_incremental_cursor_1(
+    item_type: TestDataItemFormat,
+) -> None:
+    data = [
+        {"id": 1, "created_at": None},
+        {"id": 2, "created_at": 1},
+        {"id": 3, "created_at": 2},
+    ]
+    source_items = data_to_item_format(item_type, data)
+
+    @dlt.resource
+    def some_data(
+        created_at=dlt.sources.incremental("created_at", on_cursor_value_missing="include")
+    ):
+        yield source_items
+
+    p = dlt.pipeline(pipeline_name=uniq_id())
+    p.run(some_data(), destination="duckdb")
+
+    assert_query_data(p, "select count(id) from some_data", [3])
+    assert_query_data(p, "select count(created_at) from some_data", [2])
+
+    s = p.state["sources"][p.default_schema_name]["resources"]["some_data"]["incremental"][
+        "created_at"
+    ]
+    assert s["last_value"] == 2
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_cursor_path_none_does_not_include_overlapping_records(
+    item_type: TestDataItemFormat,
+) -> None:
+    @dlt.resource
+    def some_data(
+        invocation: int,
+        created_at=dlt.sources.incremental("created_at", on_cursor_value_missing="include"),
+    ):
+        if invocation == 1:
+            yield data_to_item_format(
+                item_type,
+                [
+                    {"id": 1, "created_at": None},
+                    {"id": 2, "created_at": 1},
+                    {"id": 3, "created_at": 2},
+                ],
+            )
+        elif invocation == 2:
+            yield data_to_item_format(
+                item_type,
+                [
+                    {"id": 4, "created_at": 1},
+                    {"id": 5, "created_at": None},
+                    {"id": 6, "created_at": 3},
+                ],
+            )
+
+    p = dlt.pipeline(pipeline_name=uniq_id())
+    p.run(some_data(1), destination="duckdb")
+    p.run(some_data(2), destination="duckdb")
+
+    assert_query_data(p, "select id from some_data order by id", [1, 2, 3, 5, 6])
+    assert_query_data(
+        p, "select created_at from some_data order by created_at", [1, 2, 3, None, None]
+    )
+
+    s = p.state["sources"][p.default_schema_name]["resources"]["some_data"]["incremental"][
+        "created_at"
+    ]
+    assert s["last_value"] == 3
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_cursor_path_none_includes_records_and_updates_incremental_cursor_2(
+    item_type: TestDataItemFormat,
+) -> None:
+    data = [
+        {"id": 1, "created_at": 1},
+        {"id": 2, "created_at": None},
+        {"id": 3, "created_at": 2},
+    ]
+    source_items = data_to_item_format(item_type, data)
+
+    @dlt.resource
+    def some_data(
+        created_at=dlt.sources.incremental("created_at", on_cursor_value_missing="include")
+    ):
+        yield source_items
+
+    p = dlt.pipeline(pipeline_name=uniq_id())
+    p.run(some_data(), destination="duckdb")
+
+    assert_query_data(p, "select count(id) from some_data", [3])
+    assert_query_data(p, "select count(created_at) from some_data", [2])
+
+    s = p.state["sources"][p.default_schema_name]["resources"]["some_data"]["incremental"][
+        "created_at"
+    ]
+    assert s["last_value"] == 2
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_cursor_path_none_includes_records_and_updates_incremental_cursor_3(
+    item_type: TestDataItemFormat,
+) -> None:
+    data = [
+        {"id": 1, "created_at": 1},
+        {"id": 2, "created_at": 2},
+        {"id": 3, "created_at": None},
+    ]
+    source_items = data_to_item_format(item_type, data)
+
+    @dlt.resource
+    def some_data(
+        created_at=dlt.sources.incremental("created_at", on_cursor_value_missing="include")
+    ):
+        yield source_items
+
+    p = dlt.pipeline(pipeline_name=uniq_id())
+    p.run(some_data(), destination="duckdb")
+    assert_query_data(p, "select count(id) from some_data", [3])
+    assert_query_data(p, "select count(created_at) from some_data", [2])
+
+    s = p.state["sources"][p.default_schema_name]["resources"]["some_data"]["incremental"][
+        "created_at"
+    ]
+    assert s["last_value"] == 2
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_cursor_path_none_includes_records_without_cursor_path(
+    item_type: TestDataItemFormat,
+) -> None:
+    data = [
+        {"id": 1, "created_at": 1},
+        {"id": 2},
+    ]
+    source_items = data_to_item_format(item_type, data)
+
+    @dlt.resource
+    def some_data(
+        created_at=dlt.sources.incremental("created_at", on_cursor_value_missing="include")
+    ):
+        yield source_items
+
+    p = dlt.pipeline(pipeline_name=uniq_id())
+    p.run(some_data(), destination="duckdb")
+    assert_query_data(p, "select count(id) from some_data", [2])
+    assert_query_data(p, "select count(created_at) from some_data", [1])
+
+    s = p.state["sources"][p.default_schema_name]["resources"]["some_data"]["incremental"][
+        "created_at"
+    ]
+    assert s["last_value"] == 1
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_cursor_path_none_excludes_records_and_updates_incremental_cursor(
+    item_type: TestDataItemFormat,
+) -> None:
+    data = [
+        {"id": 1, "created_at": 1},
+        {"id": 2, "created_at": 2},
+        {"id": 3, "created_at": None},
+    ]
+    source_items = data_to_item_format(item_type, data)
+
+    @dlt.resource
+    def some_data(
+        created_at=dlt.sources.incremental("created_at", on_cursor_value_missing="exclude")
+    ):
+        yield source_items
+
+    p = dlt.pipeline(pipeline_name=uniq_id())
+    p.run(some_data(), destination="duckdb")
+    assert_query_data(p, "select count(id) from some_data", [2])
+
+    s = p.state["sources"][p.default_schema_name]["resources"]["some_data"]["incremental"][
+        "created_at"
+    ]
+    assert s["last_value"] == 2
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_cursor_path_none_can_raise_on_none_1(item_type: TestDataItemFormat) -> None:
+    data = [
+        {"id": 1, "created_at": 1},
+        {"id": 2, "created_at": None},
+        {"id": 3, "created_at": 2},
+    ]
+    source_items = data_to_item_format(item_type, data)
+
+    @dlt.resource
+    def some_data(
+        created_at=dlt.sources.incremental("created_at", on_cursor_value_missing="raise")
+    ):
+        yield source_items
+
+    with pytest.raises(IncrementalCursorPathHasValueNone) as py_ex:
+        list(some_data())
+    assert py_ex.value.json_path == "created_at"
+
+    # same thing when run in pipeline
+    with pytest.raises(PipelineStepFailed) as pip_ex:
+        p = dlt.pipeline(pipeline_name=uniq_id())
+        p.extract(some_data())
+
+    assert isinstance(pip_ex.value.__context__, IncrementalCursorPathHasValueNone)
+    assert pip_ex.value.__context__.json_path == "created_at"
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_cursor_path_none_can_raise_on_none_2(item_type: TestDataItemFormat) -> None:
+    data = [
+        {"id": 1, "created_at": 1},
+        {"id": 2},
+        {"id": 3, "created_at": 2},
+    ]
+    source_items = data_to_item_format(item_type, data)
+
+    @dlt.resource
+    def some_data(
+        created_at=dlt.sources.incremental("created_at", on_cursor_value_missing="raise")
+    ):
+        yield source_items
+
+    # there is no fixed, error because cursor path is missing
+    if item_type == "object":
+        with pytest.raises(IncrementalCursorPathMissing) as ex:
+            list(some_data())
+        assert ex.value.json_path == "created_at"
+    # there is a fixed schema, error because value is null
+    else:
+        with pytest.raises(IncrementalCursorPathHasValueNone) as e:
+            list(some_data())
+        assert e.value.json_path == "created_at"
+
+    # same thing when run in pipeline
+    with pytest.raises(PipelineStepFailed) as e:  # type: ignore[assignment]
+        p = dlt.pipeline(pipeline_name=uniq_id())
+        p.extract(some_data())
+    if item_type == "object":
+        assert isinstance(e.value.__context__, IncrementalCursorPathMissing)
+    else:
+        assert isinstance(e.value.__context__, IncrementalCursorPathHasValueNone)
+    assert e.value.__context__.json_path == "created_at"  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("item_type", ["arrow-table", "arrow-batch", "pandas"])
+def test_cursor_path_none_can_raise_on_column_missing(item_type: TestDataItemFormat) -> None:
+    data = [
+        {"id": 1},
+        {"id": 2},
+        {"id": 3},
+    ]
+    source_items = data_to_item_format(item_type, data)
+
+    @dlt.resource
+    def some_data(
+        created_at=dlt.sources.incremental("created_at", on_cursor_value_missing="raise")
+    ):
+        yield source_items
+
+    with pytest.raises(IncrementalCursorPathMissing) as py_ex:
+        list(some_data())
+    assert py_ex.value.json_path == "created_at"
+
+    # same thing when run in pipeline
+    with pytest.raises(PipelineStepFailed) as pip_ex:
+        p = dlt.pipeline(pipeline_name=uniq_id())
+        p.extract(some_data())
+    assert pip_ex.value.__context__.json_path == "created_at"  # type: ignore[attr-defined]
+    assert isinstance(pip_ex.value.__context__, IncrementalCursorPathMissing)
+
+
+@pytest.mark.parametrize("item_type", ["arrow-table", "arrow-batch"])
+def test_cursor_path_not_nullable_arrow(
+    item_type: TestDataItemFormat,
+) -> None:
+    @dlt.resource
+    def some_data(
+        invocation: int,
+        created_at=dlt.sources.incremental("created_at", on_cursor_value_missing="include"),
+    ):
+        if invocation == 1:
+            data = [
+                {"id": 1, "created_at": 1},
+                {"id": 2, "created_at": 1},
+                {"id": 3, "created_at": 2},
+            ]
+        elif invocation == 2:
+            data = [
+                {"id": 4, "created_at": 1},
+                {"id": 5, "created_at": 2},
+                {"id": 6, "created_at": 3},
+            ]
+
+        schema = pa.schema(
+            [
+                pa.field("id", pa.int32(), nullable=False),
+                pa.field("created_at", pa.int32(), nullable=False),
+            ]
+        )
+        id_array = pa.array([item["id"] for item in data], type=pa.int32())
+        created_at_array = pa.array([item["created_at"] for item in data], type=pa.int32())
+        if item_type == "arrow-table":
+            source_items = [pa.Table.from_arrays([id_array, created_at_array], schema=schema)]
+        elif item_type == "arrow-batch":
+            source_items = [pa.RecordBatch.from_arrays([id_array, created_at_array], schema=schema)]
+
+        yield source_items
+
+    p = dlt.pipeline(pipeline_name=uniq_id())
+    p.run(some_data(1), destination="duckdb")
+    p.run(some_data(2), destination="duckdb")
+
+    assert_query_data(p, "select id from some_data order by id", [1, 2, 3, 5, 6])
+    assert_query_data(p, "select created_at from some_data order by id", [1, 1, 2, 2, 3])
+
+    s = p.state["sources"][p.default_schema_name]["resources"]["some_data"]["incremental"][
+        "created_at"
+    ]
+    assert s["last_value"] == 3
+
+
+def test_cursor_path_none_nested_can_raise_on_none_1() -> None:
+    # No nested json path support for pandas and arrow. See test_nested_cursor_path_arrow_fails
+    @dlt.resource
+    def some_data(
+        created_at=dlt.sources.incremental(
+            "data.items[0].created_at", on_cursor_value_missing="raise"
+        )
+    ):
+        yield {"data": {"items": [{"created_at": None}, {"created_at": 1}]}}
+
+    with pytest.raises(IncrementalCursorPathHasValueNone) as e:
+        list(some_data())
+    assert e.value.json_path == "data.items[0].created_at"
+
+
+def test_cursor_path_none_nested_can_raise_on_none_2() -> None:
+    # No pandas and arrow. See test_nested_cursor_path_arrow_fails
+    @dlt.resource
+    def some_data(
+        created_at=dlt.sources.incremental(
+            "data.items[*].created_at", on_cursor_value_missing="raise"
+        )
+    ):
+        yield {"data": {"items": [{"created_at": None}, {"created_at": 1}]}}
+
+    with pytest.raises(IncrementalCursorPathHasValueNone) as e:
+        list(some_data())
+    assert e.value.json_path == "data.items[*].created_at"
+
+
+def test_cursor_path_none_nested_can_include_on_none_1() -> None:
+    # No nested json path support for pandas and arrow. See test_nested_cursor_path_arrow_fails
+    @dlt.resource
+    def some_data(
+        created_at=dlt.sources.incremental(
+            "data.items[*].created_at", on_cursor_value_missing="include"
+        )
+    ):
+        yield {
+            "data": {
+                "items": [
+                    {"created_at": None},
+                    {"created_at": 1},
+                ]
+            }
+        }
+
+    results = list(some_data())
+    assert results[0]["data"]["items"] == [
+        {"created_at": None},
+        {"created_at": 1},
+    ]
+
+    p = dlt.pipeline(pipeline_name=uniq_id())
+    p.run(some_data(), destination="duckdb")
+
+    assert_query_data(p, "select count(*) from some_data__data__items", [2])
+
+
+def test_cursor_path_none_nested_can_include_on_none_2() -> None:
+    # No nested json path support for pandas and arrow. See test_nested_cursor_path_arrow_fails
+    @dlt.resource
+    def some_data(
+        created_at=dlt.sources.incremental(
+            "data.items[0].created_at", on_cursor_value_missing="include"
+        )
+    ):
+        yield {
+            "data": {
+                "items": [
+                    {"created_at": None},
+                    {"created_at": 1},
+                ]
+            }
+        }
+
+    results = list(some_data())
+    assert results[0]["data"]["items"] == [
+        {"created_at": None},
+        {"created_at": 1},
+    ]
+
+    p = dlt.pipeline(pipeline_name=uniq_id())
+    p.run(some_data(), destination="duckdb")
+
+    assert_query_data(p, "select count(*) from some_data__data__items", [2])
+
+
+def test_cursor_path_none_nested_includes_rows_without_cursor_path() -> None:
+    # No nested json path support for pandas and arrow. See test_nested_cursor_path_arrow_fails
+    @dlt.resource
+    def some_data(
+        created_at=dlt.sources.incremental(
+            "data.items[*].created_at", on_cursor_value_missing="include"
+        )
+    ):
+        yield {
+            "data": {
+                "items": [
+                    {"id": 1},
+                    {"id": 2, "created_at": 2},
+                ]
+            }
+        }
+
+    results = list(some_data())
+    assert results[0]["data"]["items"] == [
+        {"id": 1},
+        {"id": 2, "created_at": 2},
+    ]
+
+    p = dlt.pipeline(pipeline_name=uniq_id())
+    p.run(some_data(), destination="duckdb")
+
+    assert_query_data(p, "select count(*) from some_data__data__items", [2])
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_set_default_value_for_incremental_cursor(item_type: TestDataItemFormat) -> None:
+    @dlt.resource
+    def some_data(created_at=dlt.sources.incremental("updated_at")):
+        yield data_to_item_format(
+            item_type,
+            [
+                {"id": 1, "created_at": 1, "updated_at": 1},
+                {"id": 2, "created_at": 4, "updated_at": None},
+                {"id": 3, "created_at": 3, "updated_at": 3},
+            ],
+        )
+
+    def set_default_updated_at(record):
+        if record.get("updated_at") is None:
+            record["updated_at"] = record.get("created_at", pendulum.now().int_timestamp)
+        return record
+
+    def set_default_updated_at_pandas(df):
+        df["updated_at"] = df["updated_at"].fillna(df["created_at"])
+        return df
+
+    def set_default_updated_at_arrow(records):
+        updated_at_is_null = pa.compute.is_null(records.column("updated_at"))
+        updated_at_filled = pa.compute.if_else(
+            updated_at_is_null, records.column("created_at"), records.column("updated_at")
+        )
+        if item_type == "arrow-table":
+            records = records.set_column(
+                records.schema.get_field_index("updated_at"),
+                pa.field("updated_at", records.column("updated_at").type),
+                updated_at_filled,
+            )
+        elif item_type == "arrow-batch":
+            columns = [records.column(i) for i in range(records.num_columns)]
+            columns[2] = updated_at_filled
+            records = pa.RecordBatch.from_arrays(columns, schema=records.schema)
+        return records
+
+    if item_type == "object":
+        func = set_default_updated_at
+    elif item_type == "pandas":
+        func = set_default_updated_at_pandas
+    elif item_type in ["arrow-table", "arrow-batch"]:
+        func = set_default_updated_at_arrow
+
+    result = list(some_data().add_map(func, insert_at=1))
+    values = data_item_to_list(item_type, result)
+    assert data_item_length(values) == 3
+    assert values[1]["updated_at"] == 4
+
+    # same for pipeline run
+    p = dlt.pipeline(pipeline_name=uniq_id())
+    p.extract(some_data().add_map(func, insert_at=1))
+    s = p.state["sources"][p.default_schema_name]["resources"]["some_data"]["incremental"][
+        "updated_at"
+    ]
+    assert s["last_value"] == 4
 
 
 def test_json_path_cursor() -> None:
@@ -818,12 +1419,11 @@ def test_primary_key_types(item_type: TestDataItemFormat, id_value: Any) -> None
     ):
         yield from source_items
 
-    info = p.run(some_data())
-    info.raise_on_failed_jobs()
+    p.run(some_data())
     norm_info = p.last_trace.last_normalize_info
     assert norm_info.row_counts["some_data"] == 20
     # load incrementally
-    info = p.run(some_data())
+    p.run(some_data())
     norm_info = p.last_trace.last_normalize_info
     assert "some_data" not in norm_info.row_counts
 
@@ -956,14 +1556,18 @@ def test_incremental_explicit_disable_unique_check(item_type: TestDataItemFormat
 
 @pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
 def test_apply_hints_incremental(item_type: TestDataItemFormat) -> None:
+    os.environ["COMPLETED_PROB"] = "1.0"  # make it complete immediately
     p = dlt.pipeline(pipeline_name=uniq_id(), destination="dummy")
     data = [{"created_at": 1}, {"created_at": 2}, {"created_at": 3}]
     source_items = data_to_item_format(item_type, data)
 
+    should_have_arg = True
+
     @dlt.resource
     def some_data(created_at: Optional[dlt.sources.incremental[int]] = None):
         # make sure that incremental from apply_hints is here
-        if created_at is not None:
+        if should_have_arg:
+            assert created_at is not None
             assert created_at.cursor_path == "created_at"
             assert created_at.last_value_func is max
         yield source_items
@@ -997,6 +1601,7 @@ def test_apply_hints_incremental(item_type: TestDataItemFormat) -> None:
     assert list(r) == []
 
     # remove incremental
+    should_have_arg = False
     r.apply_hints(incremental=dlt.sources.incremental.EMPTY)
     assert r.incremental is not None
     assert r.incremental.incremental is None
@@ -1007,6 +1612,7 @@ def test_apply_hints_incremental(item_type: TestDataItemFormat) -> None:
 
     # as above but we provide explicit incremental when creating resource
     p = p.drop()
+    should_have_arg = True
     r = some_data(created_at=dlt.sources.incremental("created_at", last_value_func=min))
     # hints have precedence, as expected
     r.apply_hints(incremental=dlt.sources.incremental("created_at", last_value_func=max))
@@ -1303,7 +1909,7 @@ def test_timezone_naive_datetime(item_type: TestDataItemFormat) -> None:
     )
     # will cause invalid comparison
     if item_type == "object":
-        with pytest.raises(InvalidStepFunctionArguments):
+        with pytest.raises(IncrementalCursorInvalidCoercion):
             list(resource)
     else:
         data = data_item_to_list(item_type, list(resource))
@@ -2015,7 +2621,7 @@ def test_allow_external_schedulers(item_type: TestDataItemFormat) -> None:
 
 @pytest.mark.parametrize("yield_pydantic", (True, False))
 def test_pydantic_columns_validator(yield_pydantic: bool) -> None:
-    from pydantic import BaseModel, Field, ConfigDict
+    from pydantic import BaseModel, ConfigDict, Field
 
     # forbid extra fields so "id" in json is not a valid field BUT
     # add alias for id_ that will serde "id" correctly
@@ -2053,11 +2659,8 @@ def test_pydantic_columns_validator(yield_pydantic: bool) -> None:
     pip_1_name = "test_pydantic_columns_validator_" + uniq_id()
     pipeline = dlt.pipeline(pipeline_name=pip_1_name, destination="duckdb")
 
-    info = pipeline.run(test_source())
-    info.raise_on_failed_jobs()
-
-    info = pipeline.run(test_source_incremental())
-    info.raise_on_failed_jobs()
+    pipeline.run(test_source())
+    pipeline.run(test_source_incremental())
 
     # verify that right steps are at right place
     steps = test_source().table_name._pipe._steps
@@ -2065,3 +2668,1384 @@ def test_pydantic_columns_validator(yield_pydantic: bool) -> None:
     incremental_steps = test_source_incremental().table_name._pipe._steps
     assert isinstance(incremental_steps[-2], ValidateItem)
     assert isinstance(incremental_steps[-1], IncrementalResourceWrapper)
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_cursor_date_coercion(item_type: TestDataItemFormat) -> None:
+    today = datetime.today().date()
+
+    @dlt.resource()
+    def updated_is_int(updated_at=dlt.sources.incremental("updated_at", initial_value=today)):
+        data = [{"updated_at": d} for d in [1, 2, 3]]
+        yield data_to_item_format(item_type, data)
+
+    pip_1_name = "test_pydantic_columns_validator_" + uniq_id()
+    pipeline = dlt.pipeline(pipeline_name=pip_1_name, destination="duckdb")
+
+    with pytest.raises(PipelineStepFailed) as pip_ex:
+        pipeline.run(updated_is_int())
+    assert isinstance(pip_ex.value.__cause__, IncrementalCursorInvalidCoercion)
+    assert pip_ex.value.__cause__.cursor_path == "updated_at"
+
+
+def test_incremental_merge_native_representation():
+    incremental = Incremental(cursor_path="some_path", lag=10)  # type: ignore
+
+    native_value = Incremental(cursor_path="another_path", lag=5)  # type: ignore
+
+    incremental.parse_native_representation(native_value)
+
+    # Assert the expected changes in the incremental object
+    assert incremental.cursor_path == "another_path"
+    assert incremental.lag == 5
+
+
+@pytest.mark.parametrize("lag", [0, 1, 100, 200, 1000])
+@pytest.mark.parametrize("last_value_func", [min, max])
+def test_incremental_lag_int(lag: float, last_value_func) -> None:
+    """
+    Test incremental lag behavior for int data while using `id` as the primary key using append write disposition.
+    """
+
+    pipeline = dlt.pipeline(
+        pipeline_name=uniq_id(),
+        destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:")),
+    )
+
+    name = "events"
+    is_second_run = False
+    is_third_run = False
+
+    @dlt.resource(name=name, primary_key="id", write_disposition="append")
+    def events_resource(_=dlt.sources.incremental("id", lag=lag, last_value_func=last_value_func)):
+        nonlocal is_second_run
+        nonlocal is_third_run
+
+        initial_entries = [
+            {"id": 100, "event": "100"},
+            {"id": 200, "event": "200"},
+            {"id": 300, "event": "300"},
+        ]
+
+        second_run_events = [
+            {"id": 100, "event": "100_updated_1"},
+            {"id": 200, "event": "200_updated_1"},
+            {"id": 300, "event": "300_updated_1"},
+            {"id": 400, "event": "400"},
+        ]
+
+        third_run_events = [
+            {"id": 100, "event": "100_updated_2"},
+            {"id": 200, "event": "200_updated_2"},
+            {"id": 300, "event": "300_updated_2"},
+            {"id": 400, "event": "400_updated_2"},
+            {"id": 500, "event": "500"},
+        ]
+
+        if is_second_run:
+            yield from second_run_events
+        elif is_third_run:
+            yield from third_run_events
+        else:
+            yield from initial_entries
+
+    # Run the pipeline three times
+    pipeline.run(events_resource)
+    is_second_run = True
+    pipeline.run(events_resource)
+    is_second_run = False
+    is_third_run = True
+    pipeline.run(events_resource)
+
+    # Results using APPEND write disposition
+    # Expected results based on `last_value_func`
+    if last_value_func == max:
+        expected_results = {
+            1000: [
+                "100",
+                "200",
+                "300",
+                "100_updated_1",
+                "200_updated_1",
+                "300_updated_1",
+                "400",
+                "100_updated_2",
+                "200_updated_2",
+                "300_updated_2",
+                "400_updated_2",
+                "500",
+            ],
+            200: [
+                "100",
+                "200",
+                "300",
+                "100_updated_1",
+                "200_updated_1",
+                "300_updated_1",
+                "400",
+                "200_updated_2",
+                "300_updated_2",
+                "400_updated_2",
+                "500",
+            ],
+            100: [
+                "100",
+                "200",
+                "300",
+                "200_updated_1",
+                "300_updated_1",
+                "400",
+                "300_updated_2",
+                "400_updated_2",
+                "500",
+            ],
+            1: ["100", "200", "300", "300_updated_1", "400", "400_updated_2", "500"],
+            0: ["100", "200", "300", "400", "500"],
+        }
+    else:
+        expected_results = {
+            1000: [
+                "100",
+                "200",
+                "300",
+                "100_updated_1",
+                "200_updated_1",
+                "300_updated_1",
+                "400",
+                "100_updated_2",
+                "200_updated_2",
+                "300_updated_2",
+                "400_updated_2",
+                "500",
+            ],
+            200: [
+                "100",
+                "200",
+                "300",
+                "100_updated_1",
+                "200_updated_1",
+                "300_updated_1",
+                "100_updated_2",
+                "200_updated_2",
+                "300_updated_2",
+            ],
+            100: [
+                "100",
+                "200",
+                "300",
+                "100_updated_1",
+                "200_updated_1",
+                "100_updated_2",
+                "200_updated_2",
+            ],
+            1: ["100", "200", "300", "100_updated_1", "100_updated_2"],
+            0: ["100", "200", "300"],
+        }
+
+    with pipeline.sql_client() as sql_client:
+        result = [
+            row[0]
+            for row in sql_client.execute_sql(f"SELECT event FROM {name} ORDER BY _dlt_load_id, id")
+        ]
+        assert result == expected_results[int(lag)]
+
+
+@pytest.mark.parametrize("lag", [7200, 3601, 3600, 60, 0])
+@pytest.mark.parametrize("last_value_func", [min, max])
+def test_incremental_lag_datetime_str(lag: float, last_value_func) -> None:
+    """
+    Test incremental lag behavior for datetime data while using `id` as the primary key using merge write disposition.
+    """
+
+    pipeline = dlt.pipeline(
+        pipeline_name=uniq_id(),
+        destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:")),
+    )
+
+    name = "events"
+    is_second_run = False
+    is_third_run = False
+
+    @dlt.resource(name=name, primary_key="id", write_disposition="merge")
+    def events_resource(
+        _=dlt.sources.incremental("created_at", lag=lag, last_value_func=last_value_func)
+    ):
+        nonlocal is_second_run
+        nonlocal is_third_run
+
+        initial_entries = [
+            {"id": 1, "created_at": "2023-03-03T01:00:00Z", "event": "1"},
+            {"id": 2, "created_at": "2023-03-03T01:00:01Z", "event": "2"},
+            {"id": 3, "created_at": "2023-03-03T02:00:01Z", "event": "3"},
+        ]
+
+        second_run_events = [
+            {"id": 1, "created_at": "2023-03-03T01:00:00Z", "event": "1_updated_1"},
+            {"id": 2, "created_at": "2023-03-03T01:00:01Z", "event": "2_updated_1"},
+            {"id": 3, "created_at": "2023-03-03T02:00:01Z", "event": "3_updated_1"},
+            {"id": 4, "created_at": "2023-03-03T03:00:00Z", "event": "4"},
+        ]
+
+        third_run_events = [
+            {"id": 1, "created_at": "2023-03-03T01:00:00Z", "event": "1_updated_2"},
+            {"id": 2, "created_at": "2023-03-03T01:00:01Z", "event": "2_updated_2"},
+            {"id": 3, "created_at": "2023-03-03T02:00:01Z", "event": "3_updated_2"},
+            {"id": 4, "created_at": "2023-03-03T03:00:00Z", "event": "4_updated_2"},
+            {"id": 5, "created_at": "2023-03-03T03:00:00Z", "event": "5"},
+        ]
+
+        if is_second_run:
+            yield from second_run_events
+        elif is_third_run:
+            yield from third_run_events
+        else:
+            yield from initial_entries
+
+    # Run the pipeline three times
+    pipeline.run(events_resource)
+    is_second_run = True
+    pipeline.run(events_resource)
+    is_second_run = False
+    is_third_run = True
+    pipeline.run(events_resource)
+
+    # Results using MERGE write disposition
+    # Expected results based on `last_value_func`
+    if last_value_func == max:
+        expected_results = {
+            7200: ["1_updated_2", "2_updated_2", "3_updated_2", "4_updated_2", "5"],
+            3601: ["1_updated_1", "2_updated_1", "3_updated_2", "4_updated_2", "5"],
+            3600: ["1", "2_updated_1", "3_updated_2", "4_updated_2", "5"],
+            60: ["1", "2", "3_updated_1", "4_updated_2", "5"],
+            0: ["1", "2", "3", "4", "5"],
+        }
+    else:
+        expected_results = {
+            7200: ["1_updated_2", "2_updated_2", "3_updated_2", "4_updated_2", "5"],
+            3601: ["1_updated_2", "2_updated_2", "3_updated_2"],
+            3600: ["3", "1_updated_2", "2_updated_2"],
+            60: ["3", "1_updated_2", "2_updated_2"],
+            0: ["1", "2", "3"],
+        }
+
+    with pipeline.sql_client() as sql_client:
+        result = [
+            row[0]
+            for row in sql_client.execute_sql(f"SELECT event FROM {name} ORDER BY _dlt_load_id, id")
+        ]
+        assert result == expected_results[int(lag)]
+
+
+@pytest.mark.parametrize("lag", [3601, 3600, 60, 0])
+def test_incremental_lag_disabled_with_custom_last_value_func(lag: float) -> None:
+    """
+    Test incremental lag is disabled when not using min or max as incremental last_value_func
+    """
+
+    pipeline = dlt.pipeline(
+        pipeline_name=uniq_id(),
+        destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:")),
+    )
+
+    name = "events"
+    is_second_run = False
+
+    def custom_function(values):
+        return max(values)
+
+    @dlt.resource(name=name, primary_key="id", write_disposition="append")
+    def events_resource(_=dlt.sources.incremental("id", lag=lag, last_value_func=custom_function)):
+        nonlocal is_second_run
+
+        initial_entries = [
+            {"id": 100, "event": "100"},
+            {"id": 200, "event": "200"},
+            {"id": 300, "event": "300"},
+        ]
+
+        second_run_events = [
+            {"id": 100, "event": "100_updated_1"},
+            {"id": 200, "event": "200_updated_1"},
+            {"id": 300, "event": "300_updated_1"},
+            {"id": 400, "event": "400"},
+        ]
+
+        yield second_run_events if is_second_run else initial_entries
+
+    # Run the pipeline three times
+    pipeline.run(events_resource)
+    is_second_run = True
+    pipeline.run(events_resource)
+
+    with pipeline.sql_client() as sql_client:
+        result = [
+            row[0]
+            for row in sql_client.execute_sql(f"SELECT event FROM {name} ORDER BY _dlt_load_id, id")
+        ]
+        assert result == ["100", "200", "300", "400"]
+
+
+@pytest.mark.parametrize("lag", [-3601, -3600, -60, 0])
+@pytest.mark.parametrize("end_value", [-1, 0, 500])
+def test_incremental_lag_disabled_with_end_values(lag: float, end_value: float) -> None:
+    """
+    Test incremental lag is disabled when not using end_value
+    """
+
+    pipeline = dlt.pipeline(
+        pipeline_name=uniq_id(),
+        destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:")),
+    )
+
+    name = "events"
+    is_second_run = False
+
+    @dlt.resource(name=name, primary_key="id", write_disposition="append")
+    def events_resource(
+        _=dlt.sources.incremental("id", lag=lag, initial_value=-450, end_value=end_value)
+    ):
+        nonlocal is_second_run
+
+        # prepare negative ids so for all end_values we load the table with cutoff at -450
+        # lag, if present would skip values even from initial load (lag==-3600)
+        initial_entries = [
+            {"id": -100, "event": "100"},
+            {"id": -200, "event": "200"},
+            {"id": -300, "event": "300"},
+        ]
+
+        second_run_events = [
+            {"id": -100, "event": "100_updated_1"},
+            {"id": -200, "event": "200_updated_1"},
+            {"id": -300, "event": "300_updated_1"},
+            {"id": -400, "event": "400"},
+            {"id": -500, "event": "500"},
+            {"id": -600, "event": "600"},
+            {"id": -700, "event": "700"},
+        ]
+
+        yield second_run_events if is_second_run else initial_entries
+
+    # Run the pipeline three times
+    pipeline.run(events_resource)
+    is_second_run = True
+    pipeline.run(events_resource)
+
+    with pipeline.sql_client() as sql_client:
+        result = [
+            row[0]
+            for row in sql_client.execute_sql(
+                f"SELECT event FROM {name} ORDER BY _dlt_load_id ASC, id DESC"
+            )
+        ]
+        assert result == [
+            "100",
+            "200",
+            "300",
+            "100_updated_1",
+            "200_updated_1",
+            "300_updated_1",
+            "400",
+        ]
+
+
+@pytest.mark.parametrize("lag", [3, 2, 1, 0])  # Lag in days
+@pytest.mark.parametrize("last_value_func", [min, max])
+def test_incremental_lag_date_str(lag: int, last_value_func) -> None:
+    """
+    Test incremental lag behavior for date data while using `id` as the primary key using merge write disposition.
+    """
+
+    pipeline = dlt.pipeline(
+        pipeline_name=uniq_id(),
+        destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:")),
+    )
+
+    name = "events"
+    is_second_run = False
+    is_third_run = False
+
+    @dlt.resource(name=name, primary_key="id", write_disposition="append")
+    def events_resource(
+        _=dlt.sources.incremental("created_at", lag=lag, last_value_func=last_value_func)
+    ):
+        nonlocal is_second_run
+        nonlocal is_third_run
+
+        initial_entries = [
+            {"id": 1, "created_at": "2023-03-01", "event": "1"},
+            {"id": 2, "created_at": "2023-03-02", "event": "2"},
+            {"id": 3, "created_at": "2023-03-03", "event": "3"},
+        ]
+
+        second_run_events = [
+            {"id": 1, "created_at": "2023-03-01", "event": "1_updated_1"},
+            {"id": 2, "created_at": "2023-03-02", "event": "2_updated_1"},
+            {"id": 3, "created_at": "2023-03-03", "event": "3_updated_1"},
+            {"id": 4, "created_at": "2023-03-04", "event": "4"},
+        ]
+
+        third_run_events = [
+            {"id": 1, "created_at": "2023-03-01", "event": "1_updated_2"},
+            {"id": 2, "created_at": "2023-03-02", "event": "2_updated_2"},
+            {"id": 3, "created_at": "2023-03-03", "event": "3_updated_2"},
+            {"id": 4, "created_at": "2023-03-04", "event": "4_updated_2"},
+            {"id": 5, "created_at": "2023-03-05", "event": "5"},
+        ]
+
+        if is_second_run:
+            yield from second_run_events
+        elif is_third_run:
+            yield from third_run_events
+        else:
+            yield from initial_entries
+
+    # Run the pipeline three times
+    pipeline.run(events_resource)
+    is_second_run = True
+    pipeline.run(events_resource)
+    is_second_run = False
+    is_third_run = True
+    pipeline.run(events_resource)
+
+    # Expected results based on `last_value_func` and lag (in days)
+    if last_value_func == max:
+        expected_results = {
+            3: [
+                "1",
+                "2",
+                "3",
+                "1_updated_1",
+                "2_updated_1",
+                "3_updated_1",
+                "4",
+                "1_updated_2",
+                "2_updated_2",
+                "3_updated_2",
+                "4_updated_2",
+                "5",
+            ],
+            2: [
+                "1",
+                "2",
+                "3",
+                "1_updated_1",
+                "2_updated_1",
+                "3_updated_1",
+                "4",
+                "2_updated_2",
+                "3_updated_2",
+                "4_updated_2",
+                "5",
+            ],
+            1: [
+                "1",
+                "2",
+                "3",
+                "2_updated_1",
+                "3_updated_1",
+                "4",
+                "3_updated_2",
+                "4_updated_2",
+                "5",
+            ],
+            0: ["1", "2", "3", "4", "5"],
+        }
+    else:
+        expected_results = {
+            3: [
+                "1",
+                "2",
+                "3",
+                "1_updated_1",
+                "2_updated_1",
+                "3_updated_1",
+                "4",
+                "1_updated_2",
+                "2_updated_2",
+                "3_updated_2",
+                "4_updated_2",
+            ],
+            2: [
+                "1",
+                "2",
+                "3",
+                "1_updated_1",
+                "2_updated_1",
+                "3_updated_1",
+                "1_updated_2",
+                "2_updated_2",
+                "3_updated_2",
+            ],
+            1: ["1", "2", "3", "1_updated_1", "2_updated_1", "1_updated_2", "2_updated_2"],
+            0: ["1", "2", "3"],
+        }
+
+    with pipeline.sql_client() as sql_client:
+        result = [
+            row[0]
+            for row in sql_client.execute_sql(f"SELECT event FROM {name} ORDER BY _dlt_load_id, id")
+        ]
+        assert result == expected_results[lag]
+
+
+@pytest.mark.parametrize("lag", [3, 2, 1, 0])  # Lag in days
+@pytest.mark.parametrize("last_value_func", [min, max])
+def test_incremental_lag_date_datetime(lag: int, last_value_func) -> None:
+    """
+    Test incremental lag behavior for date data while using `id` as the primary key using merge write disposition.
+    """
+
+    pipeline = dlt.pipeline(
+        pipeline_name=uniq_id(),
+        destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:")),
+    )
+
+    name = "events"
+    is_second_run = False
+    is_third_run = False
+
+    @dlt.resource(name=name, primary_key="id", write_disposition="append")
+    def events_resource(
+        _=dlt.sources.incremental("created_at", lag=lag, last_value_func=last_value_func)
+    ):
+        nonlocal is_second_run
+        nonlocal is_third_run
+
+        initial_entries = [
+            {"id": 1, "created_at": date(2023, 3, 1), "event": "1"},
+            {"id": 2, "created_at": date(2023, 3, 2), "event": "2"},
+            {"id": 3, "created_at": date(2023, 3, 3), "event": "3"},
+        ]
+
+        second_run_events = [
+            {"id": 1, "created_at": date(2023, 3, 1), "event": "1_updated_1"},
+            {"id": 2, "created_at": date(2023, 3, 2), "event": "2_updated_1"},
+            {"id": 3, "created_at": date(2023, 3, 3), "event": "3_updated_1"},
+            {"id": 4, "created_at": date(2023, 3, 4), "event": "4"},
+        ]
+
+        third_run_events = [
+            {"id": 1, "created_at": date(2023, 3, 1), "event": "1_updated_2"},
+            {"id": 2, "created_at": date(2023, 3, 2), "event": "2_updated_2"},
+            {"id": 3, "created_at": date(2023, 3, 3), "event": "3_updated_2"},
+            {"id": 4, "created_at": date(2023, 3, 4), "event": "4_updated_2"},
+            {"id": 5, "created_at": date(2023, 3, 5), "event": "5"},
+        ]
+
+        if is_second_run:
+            yield from second_run_events
+        elif is_third_run:
+            yield from third_run_events
+        else:
+            yield from initial_entries
+
+    # Run the pipeline three times
+    pipeline.run(events_resource)
+    is_second_run = True
+    pipeline.run(events_resource)
+    is_second_run = False
+    is_third_run = True
+    pipeline.run(events_resource)
+
+    # Expected results based on `last_value_func` and lag (in days)
+    if last_value_func == max:
+        expected_results = {
+            3: [
+                "1",
+                "2",
+                "3",
+                "1_updated_1",
+                "2_updated_1",
+                "3_updated_1",
+                "4",
+                "1_updated_2",
+                "2_updated_2",
+                "3_updated_2",
+                "4_updated_2",
+                "5",
+            ],
+            2: [
+                "1",
+                "2",
+                "3",
+                "1_updated_1",
+                "2_updated_1",
+                "3_updated_1",
+                "4",
+                "2_updated_2",
+                "3_updated_2",
+                "4_updated_2",
+                "5",
+            ],
+            1: [
+                "1",
+                "2",
+                "3",
+                "2_updated_1",
+                "3_updated_1",
+                "4",
+                "3_updated_2",
+                "4_updated_2",
+                "5",
+            ],
+            0: ["1", "2", "3", "4", "5"],
+        }
+    else:
+        expected_results = {
+            3: [
+                "1",
+                "2",
+                "3",
+                "1_updated_1",
+                "2_updated_1",
+                "3_updated_1",
+                "4",
+                "1_updated_2",
+                "2_updated_2",
+                "3_updated_2",
+                "4_updated_2",
+            ],
+            2: [
+                "1",
+                "2",
+                "3",
+                "1_updated_1",
+                "2_updated_1",
+                "3_updated_1",
+                "1_updated_2",
+                "2_updated_2",
+                "3_updated_2",
+            ],
+            1: ["1", "2", "3", "1_updated_1", "2_updated_1", "1_updated_2", "2_updated_2"],
+            0: ["1", "2", "3"],
+        }
+
+    with pipeline.sql_client() as sql_client:
+        result = [
+            row[0]
+            for row in sql_client.execute_sql(f"SELECT event FROM {name} ORDER BY _dlt_load_id, id")
+        ]
+        assert result == expected_results[lag]
+
+
+@pytest.mark.parametrize("lag", [200, 1000])
+@pytest.mark.parametrize("last_value_func", [min, max])
+def test_incremental_lag_int_with_initial_values(lag: float, last_value_func) -> None:
+    """
+    Test incremental lag behavior with initial_values for int data while using `id` as the primary key using append write disposition.
+    """
+
+    pipeline = dlt.pipeline(
+        pipeline_name=uniq_id(),
+        destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:")),
+    )
+
+    name = "events"
+    is_second_run = False
+    is_third_run = False
+
+    @dlt.resource(name=name, primary_key="id", write_disposition="append")
+    def events_resource(
+        _=dlt.sources.incremental("id", lag=lag, initial_value=200, last_value_func=last_value_func)
+    ):
+        nonlocal is_second_run
+        nonlocal is_third_run
+
+        initial_entries = [
+            {"id": 100, "event": "100"},
+            {"id": 200, "event": "200"},
+            {"id": 300, "event": "300"},
+        ]
+
+        second_run_events = [
+            {"id": 100, "event": "100_updated_1"},
+            {"id": 200, "event": "200_updated_1"},
+            {"id": 300, "event": "300_updated_1"},
+            {"id": 400, "event": "400"},
+        ]
+
+        third_run_events = [
+            {"id": 100, "event": "100_updated_2"},
+            {"id": 200, "event": "200_updated_2"},
+            {"id": 300, "event": "300_updated_2"},
+            {"id": 400, "event": "400_updated_2"},
+            {"id": 500, "event": "500"},
+        ]
+
+        if is_second_run:
+            yield from second_run_events
+        elif is_third_run:
+            yield from third_run_events
+        else:
+            yield from initial_entries
+
+    # Run the pipeline three times
+    pipeline.run(events_resource)
+    is_second_run = True
+    pipeline.run(events_resource)
+    is_second_run = False
+    is_third_run = True
+    pipeline.run(events_resource)
+
+    # Results using APPEND write disposition
+    # Expected results based on `last_value_func`
+    if last_value_func == max:
+        expected_results = {
+            1000: [
+                "200",
+                "300",
+                "200_updated_1",
+                "300_updated_1",
+                "400",
+                "200_updated_2",
+                "300_updated_2",
+                "400_updated_2",
+                "500",
+            ],
+            200: [
+                "200",
+                "300",
+                "200_updated_1",
+                "300_updated_1",
+                "400",
+                "200_updated_2",
+                "300_updated_2",
+                "400_updated_2",
+                "500",
+            ],
+        }
+    else:
+        expected_results = {
+            1000: [
+                "100",
+                "200",
+                "100_updated_1",
+                "200_updated_1",
+                "100_updated_2",
+                "200_updated_2",
+            ],
+            200: [
+                "100",
+                "200",
+                "100_updated_1",
+                "200_updated_1",
+                "100_updated_2",
+                "200_updated_2",
+            ],
+        }
+
+    with pipeline.sql_client() as sql_client:
+        result = [
+            row[0]
+            for row in sql_client.execute_sql(f"SELECT event FROM {name} ORDER BY _dlt_load_id, id")
+        ]
+        assert result == expected_results[int(lag)]
+
+
+@pytest.mark.parametrize("lag", [0, 1.0, 1.5, 2.0])
+@pytest.mark.parametrize("last_value_func", [min, max])
+def test_incremental_lag_float(lag: float, last_value_func) -> None:
+    """
+    Test incremental lag behavior for int data while using `id` as the primary key using append write disposition.
+    """
+
+    pipeline = dlt.pipeline(
+        pipeline_name=uniq_id(),
+        destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:")),
+    )
+
+    name = "events"
+    is_second_run = False
+    is_third_run = False
+
+    @dlt.resource(name=name, primary_key="id", write_disposition="append")
+    def events_resource(_=dlt.sources.incremental("id", lag=lag, last_value_func=last_value_func)):
+        nonlocal is_second_run
+        nonlocal is_third_run
+
+        initial_entries = [
+            {"id": 1.0, "event": "1"},
+            {"id": 2.0, "event": "2"},
+        ]
+
+        second_run_events = [
+            {"id": 1.0, "event": "1_updated_1"},
+            {"id": 2.0, "event": "2_updated_1"},
+            {"id": 2.5, "event": "2-5"},
+        ]
+
+        third_run_events = [
+            {"id": 1.0, "event": "1_updated_2"},
+            {"id": 2.0, "event": "2_updated_2"},
+            {"id": 2.5, "event": "2-5_updated_2"},
+            {"id": 3.0, "event": "3"},
+        ]
+
+        if is_second_run:
+            yield from second_run_events
+        elif is_third_run:
+            yield from third_run_events
+        else:
+            yield from initial_entries
+
+    # Run the pipeline three times
+    pipeline.run(events_resource)
+    is_second_run = True
+    pipeline.run(events_resource)
+    is_second_run = False
+    is_third_run = True
+    pipeline.run(events_resource)
+
+    # Results using APPEND write disposition
+    # Expected results based on `last_value_func`
+    if last_value_func == max:
+        expected_results = {
+            2.0: [
+                "1",
+                "2",
+                "1_updated_1",
+                "2_updated_1",
+                "2-5",
+                "1_updated_2",
+                "2_updated_2",
+                "2-5_updated_2",
+                "3",
+            ],
+            1.5: [
+                "1",
+                "2",
+                "1_updated_1",
+                "2_updated_1",
+                "2-5",
+                "1_updated_2",
+                "2_updated_2",
+                "2-5_updated_2",
+                "3",
+            ],
+            1.0: [
+                "1",
+                "2",
+                "1_updated_1",
+                "2_updated_1",
+                "2-5",
+                "2_updated_2",
+                "2-5_updated_2",
+                "3",
+            ],
+            0: ["1", "2", "2-5", "3"],
+        }
+    else:
+        expected_results = {
+            2.0: [
+                "1",
+                "2",
+                "1_updated_1",
+                "2_updated_1",
+                "2-5",
+                "1_updated_2",
+                "2_updated_2",
+                "2-5_updated_2",
+                "3",
+            ],
+            1.5: [
+                "1",
+                "2",
+                "1_updated_1",
+                "2_updated_1",
+                "2-5",
+                "1_updated_2",
+                "2_updated_2",
+                "2-5_updated_2",
+            ],
+            1.0: ["1", "2", "1_updated_1", "2_updated_1", "1_updated_2", "2_updated_2"],
+            0: ["1", "2"],
+        }
+
+    with pipeline.sql_client() as sql_client:
+        result = [
+            row[0]
+            for row in sql_client.execute_sql(f"SELECT event FROM {name} ORDER BY _dlt_load_id, id")
+        ]
+        assert result == expected_results[lag]
+
+
+def test_apply_lag() -> None:
+    # test date lag
+    assert apply_lag(1, None, date(2023, 3, 2), max) == date(2023, 3, 1)
+    assert apply_lag(1, None, date(2023, 3, 2), min) == date(2023, 3, 3)
+    # can't go below initial_value
+    assert apply_lag(1, date(2023, 3, 2), date(2023, 3, 2), max) == date(2023, 3, 2)
+    assert apply_lag(-1, date(2023, 3, 2), date(2023, 3, 2), max) == date(2023, 3, 3)
+    # can't go above initial_value
+    assert apply_lag(1, date(2023, 3, 2), date(2023, 3, 2), min) == date(2023, 3, 2)
+    assert apply_lag(-1, date(2023, 3, 2), date(2023, 3, 2), min) == date(2023, 3, 1)
+
+    # test str date lag
+    assert apply_lag(1, None, "2023-03-02", max) == "2023-03-01"
+    assert apply_lag(1, None, "2023-03-02", min) == "2023-03-03"
+    # initial value
+    assert apply_lag(1, "2023-03-01", "2023-03-02", max) == "2023-03-01"
+    assert apply_lag(2, "2023-03-01", "2023-03-02", max) == "2023-03-01"
+
+    assert apply_lag(1, "2023-03-03", "2023-03-02", min) == "2023-03-03"
+    assert apply_lag(2, "2023-03-03", "2023-03-02", min) == "2023-03-03"
+
+    # test datetime lag
+    assert apply_lag(1, None, datetime(2023, 3, 2, 1, 15, 30), max) == datetime(
+        2023, 3, 2, 1, 15, 29
+    )
+    assert apply_lag(1, None, datetime(2023, 3, 2, 1, 15, 30), min) == datetime(
+        2023, 3, 2, 1, 15, 31
+    )
+    # initial value
+    assert apply_lag(
+        1, datetime(2023, 3, 2, 1, 15, 29), datetime(2023, 3, 2, 1, 15, 30), max
+    ) == datetime(2023, 3, 2, 1, 15, 29)
+    assert apply_lag(
+        2, datetime(2023, 3, 2, 1, 15, 29), datetime(2023, 3, 2, 1, 15, 30), max
+    ) == datetime(2023, 3, 2, 1, 15, 29)
+    assert apply_lag(
+        1, datetime(2023, 3, 2, 1, 15, 31), datetime(2023, 3, 2, 1, 15, 30), min
+    ) == datetime(2023, 3, 2, 1, 15, 31)
+    assert apply_lag(
+        2, datetime(2023, 3, 2, 1, 15, 31), datetime(2023, 3, 2, 1, 15, 30), min
+    ) == datetime(2023, 3, 2, 1, 15, 31)
+
+    # datetime str
+    assert apply_lag(1, None, "2023-03-03T01:15:30Z", max) == "2023-03-03T01:15:29Z"
+    assert apply_lag(1, None, "2023-03-03T01:15:30Z", min) == "2023-03-03T01:15:31Z"
+    # initial value
+    assert (
+        apply_lag(1, "2023-03-03T01:15:29Z", "2023-03-03T01:15:30Z", max) == "2023-03-03T01:15:29Z"
+    )
+    assert (
+        apply_lag(2, "2023-03-03T01:15:29Z", "2023-03-03T01:15:30Z", max) == "2023-03-03T01:15:29Z"
+    )
+    assert (
+        apply_lag(1, "2023-03-03T01:15:31Z", "2023-03-03T01:15:30Z", min) == "2023-03-03T01:15:31Z"
+    )
+    assert (
+        apply_lag(2, "2023-03-03T01:15:31Z", "2023-03-03T01:15:30Z", min) == "2023-03-03T01:15:31Z"
+    )
+
+    # int/float
+    assert apply_lag(1, None, 1, max) == 0
+    assert apply_lag(1, None, 1, min) == 2
+    # initial
+    assert apply_lag(1, 0, 1, max) == 0
+    assert apply_lag(2, 0, 1, max) == 0
+    assert apply_lag(1, 2, 1, min) == 2
+    assert apply_lag(2, 2, 1, min) == 2
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+@pytest.mark.parametrize("primary_key", ["id", None])
+def test_warning_large_deduplication_state(item_type: TestDataItemFormat, primary_key, mocker):
+    @dlt.resource(primary_key=primary_key)
+    def some_data(
+        created_at=dlt.sources.incremental("created_at"),
+    ):
+        # Cross the default threshold of 200
+        yield data_to_item_format(
+            item_type,
+            [{"id": i, "created_at": 1} for i in range(201)],
+        )
+        # Second batch adds more items but shouldn't trigger warning
+        yield data_to_item_format(
+            item_type,
+            [{"id": i, "created_at": 1} for i in range(201, 301)],
+        )
+
+    logger_spy = mocker.spy(dlt.common.logger, "warning")
+    p = dlt.pipeline(pipeline_name=uniq_id())
+    p.extract(some_data(1))
+
+    # Verify warning was called exactly once
+    warning_calls = [
+        call for call in logger_spy.call_args_list if "Large number of records" in call.args[0]
+    ]
+    assert len(warning_calls) == 1
+
+
+def _resource_for_table_hint(
+    hint_type: Literal[
+        "default_arg", "explicit_arg", "apply_hints", "default_arg_override", "decorator"
+    ],
+    data: Sequence[Dict[str, Any]],
+    incremental_arg: dlt.sources.incremental[Any],
+    incremental_arg_default: dlt.sources.incremental[Any] = None,
+) -> DltResource:
+    if incremental_arg is None and incremental_arg_default is None:
+        raise ValueError("One of the incremental arguments must be provided.")
+
+    decorator_arg = None
+    if hint_type == "default_arg":
+        default_arg = incremental_arg_default
+        override_arg = None
+    elif hint_type == "default_arg_override":
+        default_arg = incremental_arg_default
+        override_arg = incremental_arg
+    elif hint_type == "decorator":
+        default_arg = None
+        override_arg = None
+        decorator_arg = incremental_arg_default
+    else:
+        default_arg = None
+        override_arg = incremental_arg
+
+    @dlt.resource(incremental=decorator_arg)
+    def some_data(
+        updated_at: dlt.sources.incremental[Any] = default_arg,
+    ) -> Any:
+        yield data_to_item_format("object", data)
+
+    if override_arg is None:
+        return some_data()
+
+    if hint_type == "apply_hints":
+        rs = some_data()
+        rs.apply_hints(incremental=override_arg)
+        return rs
+
+    return some_data(updated_at=override_arg)
+
+
+@pytest.mark.parametrize(
+    "hint_type", ["default_arg", "explicit_arg", "apply_hints", "default_arg_override", "decorator"]
+)
+@pytest.mark.parametrize(
+    "incremental_settings",
+    [
+        {
+            "last_value_func": "min",
+            "row_order": "desc",
+            "on_cursor_value_missing": "include",
+        },
+        {"last_value_func": "max", "on_cursor_value_missing": "raise"},
+    ],
+)
+def test_incremental_table_hint_datetime_column(
+    hint_type: Literal[
+        "default_arg",
+        "explicit_arg",
+        "default_arg_override",
+        "apply_hints",
+        "decorator",
+    ],
+    incremental_settings: Dict[str, Any],
+) -> None:
+    initial_value_override = pendulum.now()
+    initial_value_default = pendulum.now().subtract(seconds=10)
+    rs = _resource_for_table_hint(
+        hint_type,
+        [{"updated_at": pendulum.now().add(seconds=i)} for i in range(1, 12)],
+        dlt.sources.incremental(
+            "updated_at", initial_value=initial_value_override, **incremental_settings
+        ),
+        dlt.sources.incremental(
+            "updated_at", initial_value=initial_value_default, **incremental_settings
+        ),
+    )
+
+    pipeline = dlt.pipeline(pipeline_name=uniq_id())
+    pipeline.extract(rs)
+
+    table_schema = pipeline.default_schema.tables["some_data"]
+
+    assert table_schema["columns"]["updated_at"]["incremental"] is True
+
+
+def incremental_instance_or_dict(use_dict: bool, **kwargs):
+    if use_dict:
+        return kwargs
+    return dlt.sources.incremental(**kwargs)
+
+
+@pytest.mark.parametrize("use_dict", [False, True])
+def test_incremental_in_resource_decorator(use_dict: bool) -> None:
+    # Incremental set in decorator, without any arguments
+    @dlt.resource(
+        incremental=incremental_instance_or_dict(
+            use_dict, cursor_path="value", initial_value=5, last_value_func=min
+        )
+    )
+    def no_incremental_arg():
+        yield [{"value": i} for i in range(10)]
+
+    result = list(no_incremental_arg())
+    # filtering is applied
+    assert result == [{"value": i} for i in range(0, 6)]
+
+    # Apply hints overrides the decorator settings
+    rs = no_incremental_arg()
+    rs.apply_hints(
+        incremental=incremental_instance_or_dict(
+            use_dict, cursor_path="value", initial_value=3, last_value_func=max
+        )
+    )
+    result = list(rs)
+    assert result == [{"value": i} for i in range(3, 10)]
+
+    @dlt.resource(
+        incremental=incremental_instance_or_dict(
+            use_dict, cursor_path="value", initial_value=5, last_value_func=min
+        )
+    )
+    def with_optional_incremental_arg(incremental: Optional[dlt.sources.incremental[int]] = None):
+        assert incremental is not None
+        yield [{"value": i} for i in range(10)]
+
+    # Decorator settings are used
+    result = list(with_optional_incremental_arg())
+    assert result == [{"value": i} for i in range(0, 6)]
+
+
+@pytest.mark.parametrize("use_dict", [False, True])
+def test_incremental_in_resource_decorator_default_arg(use_dict: bool) -> None:
+    @dlt.resource(
+        incremental=incremental_instance_or_dict(
+            use_dict, cursor_path="value", initial_value=5, last_value_func=min
+        )
+    )
+    def with_default_incremental_arg(
+        incremental: dlt.sources.incremental[int] = dlt.sources.incremental(
+            "value", initial_value=3, last_value_func=min
+        )
+    ):
+        assert incremental.last_value == initial_value
+        assert incremental.last_value_func == last_value_func
+        yield [{"value": i} for i in range(10)]
+
+    last_value_func = max
+    initial_value = 4
+    # Explicit argument overrides the default and decorator argument
+    result = list(
+        with_default_incremental_arg(
+            incremental=dlt.sources.incremental(
+                "value", initial_value=initial_value, last_value_func=last_value_func
+            )
+        )
+    )
+    assert result == [{"value": i} for i in range(4, 10)]
+
+    # Decorator param overrides function default arg
+    last_value_func = min
+    initial_value = 5
+    result = list(with_default_incremental_arg())
+    assert result == [{"value": i} for i in range(0, 6)]
+
+
+@pytest.mark.parametrize("use_dict", [False, True])
+def test_incremental_table_hint_merged_columns(use_dict: bool) -> None:
+    @dlt.resource(
+        incremental=incremental_instance_or_dict(
+            use_dict, cursor_path="col_a", initial_value=3, last_value_func=min
+        )
+    )
+    def some_data():
+        yield [{"col_a": i, "foo": i + 2, "col_b": i + 1, "bar": i + 3} for i in range(10)]
+
+    pipeline = dlt.pipeline(pipeline_name=uniq_id())
+    pipeline.extract(some_data())
+
+    table_schema = pipeline.default_schema.tables["some_data"]
+    assert table_schema["columns"]["col_a"]["incremental"] is True
+
+    rs = some_data()
+    rs.apply_hints(
+        incremental=incremental_instance_or_dict(
+            use_dict, cursor_path="col_b", initial_value=5, last_value_func=max
+        )
+    )
+
+    pipeline.extract(rs)
+
+    table_schema_2 = pipeline.default_schema.tables["some_data"]
+
+    # Only one column should have the hint
+    assert "incremental" not in table_schema_2["columns"]["col_a"]
+    assert table_schema_2["columns"]["col_b"]["incremental"] is True
+
+
+@pytest.mark.parametrize("use_dict", [True, False])
+def test_incremental_column_hint_cursor_is_not_column(use_dict: bool):
+    @dlt.resource(
+        incremental=incremental_instance_or_dict(
+            use_dict, cursor_path="col_a|col_b", initial_value=3, last_value_func=min
+        )
+    )
+    def some_data():
+        yield [{"col_a": i, "foo": i + 2, "col_b": i + 1, "bar": i + 3} for i in range(10)]
+
+    pipeline = dlt.pipeline(pipeline_name=uniq_id())
+
+    pipeline.extract(some_data())
+
+    table_schema = pipeline.default_schema.tables["some_data"]
+
+    for col in table_schema["columns"].values():
+        assert "incremental" not in col
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+@pytest.mark.parametrize("last_value_func", [min, max])
+def test_start_range_open(item_type: TestDataItemFormat, last_value_func: Any) -> None:
+    data_range: Iterable[int] = range(1, 12)
+    if last_value_func == max:
+        initial_value = 5
+        # Only items higher than inital extracted
+        expected_items = list(range(6, 12))
+        order_dir = "ASC"
+    elif last_value_func == min:
+        data_range = reversed(data_range)  # type: ignore[call-overload]
+        initial_value = 5
+        # Only items lower than inital extracted
+        expected_items = list(reversed(range(1, 5)))
+        order_dir = "DESC"
+
+    @dlt.resource
+    def some_data(
+        updated_at: dlt.sources.incremental[int] = dlt.sources.incremental(
+            "updated_at",
+            initial_value=initial_value,
+            range_start="open",
+            last_value_func=last_value_func,
+        ),
+    ) -> Any:
+        data = [{"updated_at": i} for i in data_range]
+        yield data_to_item_format(item_type, data)
+
+    pipeline = dlt.pipeline(pipeline_name=uniq_id(), destination="duckdb")
+    pipeline.run(some_data())
+
+    with pipeline.sql_client() as client:
+        items = [
+            row[0]
+            for row in client.execute_sql(
+                f"SELECT updated_at FROM some_data ORDER BY updated_at {order_dir}"
+            )
+        ]
+
+    assert items == expected_items
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_start_range_open_no_deduplication(item_type: TestDataItemFormat) -> None:
+    @dlt.source
+    def dummy():
+        @dlt.resource
+        def some_data(
+            updated_at: dlt.sources.incremental[int] = dlt.sources.incremental(
+                "updated_at",
+                range_start="open",
+            )
+        ):
+            yield [{"updated_at": i} for i in range(3)]
+
+        yield some_data
+
+    pipeline = dlt.pipeline(pipeline_name=uniq_id())
+    pipeline.extract(dummy())
+
+    state = pipeline.state["sources"]["dummy"]["resources"]["some_data"]["incremental"][
+        "updated_at"
+    ]
+
+    # No unique values should be computed
+    assert state["unique_hashes"] == []
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+@pytest.mark.parametrize("last_value_func", [min, max])
+def test_end_range_closed(item_type: TestDataItemFormat, last_value_func: Any) -> None:
+    values = [5, 10]
+    expected_items = list(range(5, 11))
+    if last_value_func == max:
+        order_dir = "ASC"
+    elif last_value_func == min:
+        values = list(reversed(values))
+        expected_items = list(reversed(expected_items))
+        order_dir = "DESC"
+
+    @dlt.resource
+    def some_data(
+        updated_at: dlt.sources.incremental[int] = dlt.sources.incremental(
+            "updated_at",
+            initial_value=values[0],
+            end_value=values[1],
+            range_end="closed",
+            last_value_func=last_value_func,
+        ),
+    ) -> Any:
+        data = [{"updated_at": i} for i in range(1, 12)]
+        yield data_to_item_format(item_type, data)
+
+    pipeline = dlt.pipeline(pipeline_name=uniq_id(), destination="duckdb")
+    pipeline.run(some_data())
+
+    with pipeline.sql_client() as client:
+        items = [
+            row[0]
+            for row in client.execute_sql(
+                f"SELECT updated_at FROM some_data ORDER BY updated_at {order_dir}"
+            )
+        ]
+
+    # Includes values 5-10 inclusive
+    assert items == expected_items
+
+
+@pytest.mark.parametrize("offset_by_last_value", [True, False])
+def test_incremental_and_limit(offset_by_last_value: bool):
+    resource_called = 0
+
+    # here we check incremental and limit when incremental once when last value cannot be used
+    # to offset the source, and once when it can.
+
+    @dlt.resource(
+        table_name="items",
+    )
+    def resource(
+        incremental=dlt.sources.incremental(cursor_path="id", initial_value=-1, row_order="asc")
+    ):
+        range_iterator = (
+            range(incremental.start_value + 1, 1000) if offset_by_last_value else range(1000)
+        )
+        for i in range_iterator:
+            nonlocal resource_called
+            resource_called += 1
+            yield {
+                "id": i,
+                "value": str(i),
+            }
+
+    resource.add_limit(10)
+
+    p = dlt.pipeline(pipeline_name="incremental_limit", destination="duckdb", dev_mode=True)
+
+    p.run(resource())
+
+    # check we have the right number of items
+    assert len(p.dataset().items.df()) == 10
+    assert resource_called == 10
+    # check that we have items 0-9
+    assert p.dataset().items.df().id.tolist() == list(range(10))
+
+    # run the next ten
+    p.run(resource())
+
+    # check we have the right number of items
+    assert len(p.dataset().items.df()) == 20
+    assert resource_called == 20 if offset_by_last_value else 30
+    # check that we have items 0-19
+    assert p.dataset().items.df().id.tolist() == list(range(20))
+
+    # run the next batch
+    p.run(resource())
+
+    # check we have the right number of items
+    assert len(p.dataset().items.df()) == 30
+    assert resource_called == 30 if offset_by_last_value else 60
+    # check that we have items 0-29
+    assert p.dataset().items.df().id.tolist() == list(range(30))

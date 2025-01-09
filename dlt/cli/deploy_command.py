@@ -4,8 +4,7 @@ import yaml
 from enum import Enum
 from importlib.metadata import version as pkg_version
 
-from dlt.common.configuration.providers import SECRETS_TOML, SECRETS_TOML_KEY, StringTomlProvider
-from dlt.common.configuration.paths import make_dlt_settings_path
+from dlt.common.configuration.providers import SECRETS_TOML, SECRETS_TOML_KEY
 from dlt.common.configuration.utils import serialize_value
 from dlt.common.git import is_dirty
 
@@ -27,7 +26,6 @@ from dlt.version import DLT_PKG_NAME
 from dlt.common.destination.reference import Destination
 
 REQUIREMENTS_GITHUB_ACTION = "requirements_github_action.txt"
-DLT_DEPLOY_DOCS_URL = "https://dlthub.com/docs/walkthroughs/deploy-a-pipeline"
 DLT_AIRFLOW_GCP_DOCS_URL = (
     "https://dlthub.com/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer"
 )
@@ -210,7 +208,7 @@ class GithubActionDeployment(BaseDeployment):
             fmt.echo(
                 "1. Add the following secret values (typically stored in %s): \n%s\nin %s"
                 % (
-                    fmt.bold(make_dlt_settings_path(SECRETS_TOML)),
+                    fmt.bold(utils.make_dlt_settings_path(SECRETS_TOML)),
                     fmt.bold(
                         "\n".join(
                             self.env_prov.get_key_name(s_v.key, *s_v.sections)
@@ -368,7 +366,7 @@ class AirflowDeployment(BaseDeployment):
                     "3. Add the following secret values (typically stored in %s): \n%s\n%s\nin"
                     " ENVIRONMENT VARIABLES using Google Composer UI"
                     % (
-                        fmt.bold(make_dlt_settings_path(SECRETS_TOML)),
+                        fmt.bold(utils.make_dlt_settings_path(SECRETS_TOML)),
                         fmt.bold(
                             "\n".join(
                                 self.env_prov.get_key_name(s_v.key, *s_v.sections)
@@ -393,12 +391,7 @@ class AirflowDeployment(BaseDeployment):
                     f" {SECRETS_TOML_KEY} variable."
                 )
                 fmt.echo()
-                toml_provider = StringTomlProvider("")
-                for s_v in self.secret_envs:
-                    toml_provider.set_value(s_v.key, s_v.value, None, *s_v.sections)
-                for s_v in self.envs:
-                    toml_provider.set_value(s_v.key, s_v.value, None, *s_v.sections)
-                fmt.echo(toml_provider.dumps())
+                self._echo_secrets_toml()
             else:
                 raise ValueError(self.secrets_format)
 

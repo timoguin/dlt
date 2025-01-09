@@ -23,7 +23,8 @@ from dlt.destinations.sql_client import (
     raise_database_error,
     raise_open_connection_error,
 )
-from dlt.destinations.typing import DBApi, DBApiCursor, DBTransaction, DataFrame
+from dlt.destinations.typing import DBApi, DBTransaction, DataFrame, ArrowTable
+from dlt.common.destination.reference import DBApiCursor
 
 
 # terminal reasons as returned in BQ gRPC error response
@@ -44,32 +45,15 @@ class BigQueryDBApiCursorImpl(DBApiCursorImpl):
     """Use native BigQuery data frame support if available"""
 
     native_cursor: BQDbApiCursor  # type: ignore
-    df_iterator: Generator[Any, None, None]
 
     def __init__(self, curr: DBApiCursor) -> None:
         super().__init__(curr)
-        self.df_iterator = None
 
-    def df(self, chunk_size: Optional[int] = None, **kwargs: Any) -> DataFrame:
-        query_job: bigquery.QueryJob = getattr(
-            self.native_cursor, "_query_job", self.native_cursor.query_job
-        )
-        if self.df_iterator:
-            return next(self.df_iterator, None)
-        try:
-            if chunk_size is not None:
-                # create iterator with given page size
-                self.df_iterator = query_job.result(page_size=chunk_size).to_dataframe_iterable()
-                return next(self.df_iterator, None)
-            return query_job.to_dataframe(**kwargs)
-        except ValueError as ex:
-            # no pyarrow/db-types, fallback to our implementation
-            logger.warning(f"Native BigQuery pandas reader could not be used: {str(ex)}")
-            return super().df(chunk_size=chunk_size)
+    def iter_df(self, chunk_size: int) -> Generator[DataFrame, None, None]:
+        yield from self.native_cursor.query_job.result(page_size=chunk_size).to_dataframe_iterable()
 
-    def close(self) -> None:
-        if self.df_iterator:
-            self.df_iterator.close()
+    def iter_arrow(self, chunk_size: int) -> Generator[ArrowTable, None, None]:
+        yield from self.native_cursor.query_job.result(page_size=chunk_size).to_arrow_iterable()
 
 
 class BigQuerySqlClient(SqlClientBase[bigquery.Client], DBTransaction):
@@ -82,14 +66,16 @@ class BigQuerySqlClient(SqlClientBase[bigquery.Client], DBTransaction):
         credentials: GcpServiceAccountCredentialsWithoutDefaults,
         capabilities: DestinationCapabilitiesContext,
         location: str = "US",
+        project_id: Optional[str] = None,
         http_timeout: float = 15.0,
         retry_deadline: float = 60.0,
     ) -> None:
         self._client: bigquery.Client = None
         self.credentials: GcpServiceAccountCredentialsWithoutDefaults = credentials
         self.location = location
+        self.project_id = project_id or self.credentials.project_id
         self.http_timeout = http_timeout
-        super().__init__(credentials.project_id, dataset_name, staging_dataset_name, capabilities)
+        super().__init__(self.project_id, dataset_name, staging_dataset_name, capabilities)
 
         self._default_retry = bigquery.DEFAULT_RETRY.with_deadline(retry_deadline)
         self._default_query = bigquery.QueryJobConfig(
@@ -100,7 +86,7 @@ class BigQuerySqlClient(SqlClientBase[bigquery.Client], DBTransaction):
     @raise_open_connection_error
     def open_connection(self) -> bigquery.Client:
         self._client = bigquery.Client(
-            self.credentials.project_id,
+            self.project_id,
             credentials=self.credentials.to_native_credentials(),
             location=self.location,
         )
@@ -240,7 +226,7 @@ class BigQuerySqlClient(SqlClientBase[bigquery.Client], DBTransaction):
                 conn.close()
 
     def catalog_name(self, escape: bool = True) -> Optional[str]:
-        project_id = self.capabilities.casefold_identifier(self.credentials.project_id)
+        project_id = self.capabilities.casefold_identifier(self.project_id)
         if escape:
             project_id = self.capabilities.escape_identifier(project_id)
         return project_id
@@ -286,6 +272,20 @@ class BigQuerySqlClient(SqlClientBase[bigquery.Client], DBTransaction):
             return DatabaseTerminalException(ex)
         # anything else is transient
         return DatabaseTransientException(ex)
+
+    def truncate_tables_if_exist(self, *tables: str) -> None:
+        """NOTE: We only truncate tables that exist, for auto-detect schema we don't know which tables exist"""
+        statements: List[str] = ["DECLARE table_exists BOOL;"]
+        for t in tables:
+            table_name = self.make_qualified_table_name(t)
+            statements.append(
+                "SET table_exists = (SELECT COUNT(*) > 0 FROM"
+                f" `{self.project_id}.{self.dataset_name}.INFORMATION_SCHEMA.TABLES` WHERE"
+                f" table_name = '{t}');"
+            )
+            truncate_stmt = self._truncate_table_sql(table_name).replace(";", "")
+            statements.append(f"IF table_exists THEN EXECUTE IMMEDIATE '{truncate_stmt}'; END IF;")
+        self.execute_many(statements)
 
     @staticmethod
     def _get_reason_from_errors(gace: api_core_exceptions.GoogleAPICallError) -> Optional[str]:

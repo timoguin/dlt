@@ -32,14 +32,25 @@ def raise_if_signalled() -> None:
         raise SignalReceivedException(_received_signal)
 
 
+def signal_received() -> bool:
+    """check if a signal was received"""
+    return True if _received_signal else False
+
+
 def sleep(sleep_seconds: float) -> None:
     """A signal-aware version of sleep function. Will raise SignalReceivedException if signal was received during sleep period."""
     # do not allow sleeping if signal was received
     raise_if_signalled()
     # sleep or wait for signal
+    exit_event.clear()
     exit_event.wait(sleep_seconds)
     # if signal then raise
     raise_if_signalled()
+
+
+def wake_all() -> None:
+    """Wakes all threads sleeping on event"""
+    exit_event.set()
 
 
 @contextmanager

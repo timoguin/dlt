@@ -4,7 +4,6 @@ import traceback
 from logging import LogRecord, Logger
 from typing import Any, Mapping, Iterator, Protocol
 
-DLT_LOGGER_NAME = "dlt"
 LOGGER: Logger = None
 
 
@@ -48,7 +47,7 @@ def is_logging() -> bool:
 def log_level() -> str:
     if not LOGGER:
         raise RuntimeError("Logger not initialized")
-    return logging.getLevelName(LOGGER.level)  # type: ignore
+    return logging.getLevelName(LOGGER.level)
 
 
 def is_json_logging(log_format: str) -> bool:
@@ -70,7 +69,7 @@ class _MetricsFormatter(logging.Formatter):
         return s
 
 
-def _init_logging(
+def _create_logger(
     logger_name: str, level: str, fmt: str, component: str, version: Mapping[str, str]
 ) -> Logger:
     if logger_name == "root":
@@ -111,3 +110,14 @@ def _init_logging(
         handler.setFormatter(_MetricsFormatter(fmt=fmt, style="{"))
 
     return logger
+
+
+def _delete_current_logger() -> None:
+    if not LOGGER:
+        return
+
+    for handler in LOGGER.handlers[:]:
+        LOGGER.removeHandler(handler)
+
+    LOGGER.disabled = True
+    LOGGER.propagate = False
