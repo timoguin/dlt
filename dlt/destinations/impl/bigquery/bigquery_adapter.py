@@ -2,11 +2,10 @@ from typing import Any, Optional, Literal, Dict
 
 from dateutil import parser
 
+from dlt.common.destination import PreparedTableSchema
 from dlt.common.pendulum import timezone
-from dlt.common.schema.typing import (
-    TColumnNames,
-    TTableSchemaColumns,
-)
+from dlt.common.schema.typing import TTableSchemaColumns
+from dlt.common.typing import TColumnNames
 from dlt.destinations.utils import get_resource_for_adapter
 from dlt.extract import DltResource
 from dlt.extract.items import TTableHintTemplate
@@ -21,6 +20,9 @@ ROUND_HALF_EVEN_HINT: Literal["x-bigquery-round-half-even"] = "x-bigquery-round-
 TABLE_EXPIRATION_HINT: Literal["x-bigquery-table-expiration"] = "x-bigquery-table-expiration"
 TABLE_DESCRIPTION_HINT: Literal["x-bigquery-table-description"] = "x-bigquery-table-description"
 AUTODETECT_SCHEMA_HINT: Literal["x-bigquery-autodetect-schema"] = "x-bigquery-autodetect-schema"
+PARTITION_EXPIRATION_DAYS_HINT: Literal["x-bigquery-partition-expiration-days"] = (
+    "x-bigquery-partition-expiration-days"
+)
 
 
 def bigquery_adapter(
@@ -33,6 +35,7 @@ def bigquery_adapter(
     table_expiration_datetime: Optional[str] = None,
     insert_api: Optional[Literal["streaming", "default"]] = None,
     autodetect_schema: Optional[bool] = None,
+    partition_expiration_days: Optional[int] = None,
 ) -> DltResource:
     """
     Prepares data for loading into BigQuery.
@@ -66,6 +69,8 @@ def bigquery_adapter(
             NOTE: due to BigQuery features, streaming insert is only available for `append` write_disposition.
         autodetect_schema (bool, optional): If set to True, BigQuery schema autodetection will be used to create data tables. This
             allows to create structured types from nested data.
+        partition_expiration_days (int, optional): For date/time based partitions it tells when partition is expired and removed.
+            Partitions are expired based on a partitioned column value. (https://cloud.google.com/bigquery/docs/managing-partitioned-tables#partition-expiration)
 
     Returns:
         A `DltResource` object that is ready to be loaded into BigQuery.
@@ -157,6 +162,12 @@ def bigquery_adapter(
         except ValueError as e:
             raise ValueError(f"{table_expiration_datetime} could not be parsed!") from e
 
+    if partition_expiration_days is not None:
+        assert isinstance(
+            partition_expiration_days, int
+        ), "partition_expiration_days must be an integer (days)"
+        additional_table_hints[PARTITION_EXPIRATION_DAYS_HINT] = partition_expiration_days
+
     if insert_api is not None:
         if insert_api == "streaming" and data.write_disposition != "append":
             raise ValueError(
@@ -174,3 +185,8 @@ def bigquery_adapter(
             " specified."
         )
     return resource
+
+
+def should_autodetect_schema(table: PreparedTableSchema) -> bool:
+    """Tells if schema should be auto detected for a given prepared `table`"""
+    return table.get(AUTODETECT_SCHEMA_HINT, False)  # type: ignore[return-value]

@@ -2,32 +2,41 @@ from configparser import DuplicateSectionError
 import os
 import argparse
 import pytest
-from airflow.cli.commands.db_command import resetdb
-from airflow.configuration import conf
-from airflow.models.variable import Variable
 
 from dlt.common.configuration.container import Container
-from dlt.common.configuration.specs.config_providers_context import ConfigProvidersContext
+from dlt.common.configuration.specs import PluggableRunContext
 from dlt.common.configuration.providers.vault import SECRETS_TOML_KEY
+
+# Test data
+SECRETS_TOML_CONTENT = """
+[sources]
+api_key = "test_value"
+"""
 
 
 @pytest.fixture(scope="function", autouse=True)
 def initialize_airflow_db():
+    from airflow.models.variable import Variable
+
     setup_airflow()
     # backup context providers
-    providers = Container()[ConfigProvidersContext]
+    providers = Container()[PluggableRunContext].providers
     # allow airflow provider
     os.environ["PROVIDERS__ENABLE_AIRFLOW_SECRETS"] = "true"
+    Variable.set(SECRETS_TOML_KEY, SECRETS_TOML_CONTENT)
     # re-create providers
-    del Container()[ConfigProvidersContext]
+    Container()[PluggableRunContext].reload_providers()
     yield
     # restore providers
-    Container()[ConfigProvidersContext] = providers
+    Container()[PluggableRunContext].providers = providers
     # Make sure the variable is not set
     Variable.delete(SECRETS_TOML_KEY)
 
 
 def setup_airflow() -> None:
+    from airflow.cli.commands.db_command import resetdb
+    from airflow.configuration import conf
+
     # Disable loading examples
     try:
         conf.add_section("core")

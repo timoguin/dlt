@@ -2,7 +2,7 @@ import csv
 import os
 import posixpath
 from pathlib import Path
-from typing import Any, Callable, List, Dict, cast
+from typing import Any, Callable, List, Dict, cast, Tuple
 from importlib.metadata import version as pkg_version
 from packaging.version import Version
 
@@ -12,13 +12,16 @@ import pytest
 
 from dlt.common import json
 from dlt.common import pendulum
+from dlt.common.storages.configuration import FilesystemConfiguration
 from dlt.common.storages.load_package import ParsedLoadJobFileName
 from dlt.common.utils import uniq_id
-from dlt.common.exceptions import DependencyVersionException
+from dlt.common.schema.typing import TWriteDisposition, TTableFormat
+from dlt.common.configuration.exceptions import ConfigurationValueError
 from dlt.destinations import filesystem
 from dlt.destinations.impl.filesystem.filesystem import FilesystemClient
 from dlt.destinations.impl.filesystem.typing import TExtraPlaceholders
 from dlt.pipeline.exceptions import PipelineStepFailed
+from dlt.load.exceptions import LoadClientJobRetry
 
 from tests.cases import arrow_table_all_data_types, table_update_and_row, assert_all_data_types_row
 from tests.common.utils import load_json_case
@@ -29,6 +32,8 @@ from tests.load.utils import (
     DestinationTestConfiguration,
     MEMORY_BUCKET,
     FILE_BUCKET,
+    AZ_BUCKET,
+    SFTP_BUCKET,
 )
 
 from tests.pipeline.utils import load_table_counts, assert_load_info, load_tables_to_dicts
@@ -41,7 +46,6 @@ def test_pipeline_merge_write_disposition(default_buckets_env: str) -> None:
     """Run pipeline twice with merge write disposition
     Regardless wether primary key is set or not, filesystem appends
     """
-    import pyarrow.parquet as pq  # Module is evaluated by other tests
 
     os.environ["DATA_WRITER__DISABLE_COMPRESSION"] = "True"
 
@@ -99,7 +103,6 @@ def test_pipeline_csv_filesystem_destination(item_type: TestDataItemFormat) -> N
 
     item, rows, _ = arrow_table_all_data_types(item_type, include_json=False, include_time=True)
     info = pipeline.run(item, table_name="table", loader_file_format="csv")
-    info.raise_on_failed_jobs()
     job = info.load_packages[0].jobs["completed_jobs"][0].file_path
     assert job.endswith("csv")
     with open(job, "r", encoding="utf-8", newline="") as f:
@@ -125,7 +128,6 @@ def test_csv_options(item_type: TestDataItemFormat) -> None:
 
     item, rows, _ = arrow_table_all_data_types(item_type, include_json=False, include_time=True)
     info = pipeline.run(item, table_name="table", loader_file_format="csv")
-    info.raise_on_failed_jobs()
     job = info.load_packages[0].jobs["completed_jobs"][0].file_path
     assert job.endswith("csv")
     with open(job, "r", encoding="utf-8", newline="") as f:
@@ -154,7 +156,6 @@ def test_csv_quoting_style(item_type: TestDataItemFormat) -> None:
 
     item, _, _ = arrow_table_all_data_types(item_type, include_json=False, include_time=True)
     info = pipeline.run(item, table_name="table", loader_file_format="csv")
-    info.raise_on_failed_jobs()
     job = info.load_packages[0].jobs["completed_jobs"][0].file_path
     assert job.endswith("csv")
     with open(job, "r", encoding="utf-8", newline="") as f:
@@ -222,6 +223,51 @@ def test_pipeline_parquet_filesystem_destination() -> None:
         assert table.column("value").to_pylist() == [1, 2, 3, 4, 5]
 
 
+# here start the `table_format` tests
+
+
+def get_expected_actual(
+    pipeline: dlt.Pipeline,
+    table_name: str,
+    table_format: TTableFormat,
+    arrow_table: "pyarrow.Table",  # type: ignore[name-defined] # noqa: F821
+) -> Tuple["pyarrow.Table", "pyarrow.Table"]:  # type: ignore[name-defined] # noqa: F821
+    from dlt.common.libs.pyarrow import pyarrow, cast_arrow_schema_types
+
+    if table_format == "delta":
+        from dlt.common.libs.deltalake import (
+            get_delta_tables,
+            ensure_delta_compatible_arrow_data,
+        )
+
+        dt = get_delta_tables(pipeline, table_name)[table_name]
+        expected = ensure_delta_compatible_arrow_data(arrow_table)
+        actual = dt.to_pyarrow_table()
+    elif table_format == "iceberg":
+        from dlt.common.libs.pyiceberg import (
+            get_iceberg_tables,
+            ensure_iceberg_compatible_arrow_data,
+        )
+
+        it = get_iceberg_tables(pipeline, table_name)[table_name]
+        expected = ensure_iceberg_compatible_arrow_data(arrow_table)
+        actual = it.scan().to_arrow()
+
+        # work around pyiceberg bug https://github.com/apache/iceberg-python/issues/1128
+        schema = cast_arrow_schema_types(
+            actual.schema,
+            {
+                pyarrow.types.is_large_string: pyarrow.string(),
+                pyarrow.types.is_large_binary: pyarrow.binary(),
+            },
+        )
+        actual = actual.cast(schema)
+    return (expected, actual)
+
+
+@pytest.mark.skip(
+    reason="pyarrow version check not needed anymore, since we have 17 as a dependency"
+)
 def test_delta_table_pyarrow_version_check() -> None:
     """Tests pyarrow version checking for `delta` table format.
 
@@ -242,56 +288,71 @@ def test_delta_table_pyarrow_version_check() -> None:
 
     with pytest.raises(PipelineStepFailed) as pip_ex:
         pipeline.run(foo())
-    assert isinstance(pip_ex.value.__context__, DependencyVersionException)
+    assert isinstance(pip_ex.value.__context__, LoadClientJobRetry)
+    assert (
+        "`pyarrow>=17.0.0` is needed for `delta` table format on `filesystem` destination"
+        in pip_ex.value.__context__.retry_message
+    )
 
 
 @pytest.mark.essential
 @pytest.mark.parametrize(
     "destination_config",
     destinations_configs(
-        all_buckets_filesystem_configs=True,
-        table_format="delta",
-        bucket_exclude=(MEMORY_BUCKET),
+        table_format_filesystem_configs=True,
+        with_table_format=("delta", "iceberg"),
+        bucket_exclude=(MEMORY_BUCKET, SFTP_BUCKET),
     ),
     ids=lambda x: x.name,
 )
-def test_delta_table_core(
+def test_table_format_core(
     destination_config: DestinationTestConfiguration,
 ) -> None:
-    """Tests core functionality for `delta` table format.
+    """Tests core functionality for `delta` and `iceberg` table formats.
 
     Tests all data types, all filesystems.
     Tests `append` and `replace` write dispositions (`merge` is tested elsewhere).
     """
-
-    from tests.pipeline.utils import _get_delta_table
+    if destination_config.table_format == "delta":
+        from dlt.common.libs.deltalake import get_delta_tables
 
     # create resource that yields rows with all data types
     column_schemas, row = table_update_and_row()
 
-    @dlt.resource(columns=column_schemas, table_format="delta")
+    @dlt.resource(columns=column_schemas, table_format=destination_config.table_format)
     def data_types():
         nonlocal row
         yield [row] * 10
 
     pipeline = destination_config.setup_pipeline("fs_pipe", dev_mode=True)
 
-    # run pipeline, this should create Delta table
+    # run pipeline, this should create table
     info = pipeline.run(data_types())
     assert_load_info(info)
 
-    # `delta` table format should use `parquet` file format
+    # table formats should use `parquet` file format
     completed_jobs = info.load_packages[0].jobs["completed_jobs"]
     data_types_jobs = [
         job for job in completed_jobs if job.job_file_info.table_name == "data_types"
     ]
     assert all([job.file_path.endswith((".parquet", ".reference")) for job in data_types_jobs])
 
-    # 10 rows should be loaded to the Delta table and the content of the first
+    # 10 rows should be loaded to the table and the content of the first
     # row should match expected values
     rows = load_tables_to_dicts(pipeline, "data_types", exclude_system_cols=True)["data_types"]
     assert len(rows) == 10
     assert_all_data_types_row(rows[0], schema=column_schemas)
+
+    # make sure remote_url is in metrics
+    metrics = info.metrics[info.loads_ids[0]][0]
+    # TODO: only final copy job has remote_url. not the initial (empty) job for particular files
+    # we could implement an empty job for delta that generates correct remote_url
+    remote_url = list(metrics["job_metrics"].values())[-1].remote_url
+    assert remote_url.endswith("data_types")
+    bucket_url = destination_config.bucket_url
+    if FilesystemConfiguration.is_local_path(bucket_url):
+        bucket_url = FilesystemConfiguration.make_file_url(bucket_url)
+    assert remote_url.startswith(bucket_url)
 
     # another run should append rows to the table
     info = pipeline.run(data_types())
@@ -303,8 +364,8 @@ def test_delta_table_core(
     # should do logical replace, increasing the table version
     info = pipeline.run(data_types(), write_disposition="replace")
     assert_load_info(info)
-    client = cast(FilesystemClient, pipeline.destination_client())
-    assert _get_delta_table(client, "data_types").version() == 2
+    if destination_config.table_format == "delta":
+        assert get_delta_tables(pipeline, "data_types")["data_types"].version() == 2
     rows = load_tables_to_dicts(pipeline, "data_types", exclude_system_cols=True)["data_types"]
     assert len(rows) == 10
 
@@ -312,20 +373,68 @@ def test_delta_table_core(
 @pytest.mark.parametrize(
     "destination_config",
     destinations_configs(
-        local_filesystem_configs=True,
-        table_format="delta",
+        table_format_filesystem_configs=True,
+        # job orchestration is same across table formats—no need to test all formats
+        with_table_format="delta",
+        bucket_subset=(FILE_BUCKET),
     ),
     ids=lambda x: x.name,
 )
-def test_delta_table_multiple_files(
+def test_table_format_does_not_contain_job_files(
     destination_config: DestinationTestConfiguration,
 ) -> None:
-    """Tests loading multiple files into a Delta table.
+    """Asserts Parquet job files do not end up in table."""
 
-    Files should be loaded into the Delta table in a single commit.
+    pipeline = destination_config.setup_pipeline("fs_pipe", dev_mode=True)
+
+    @dlt.resource(table_format="delta")
+    def delta_table():
+        yield [{"foo": 1}]
+
+    # create Delta table
+    info = pipeline.run(delta_table())
+    assert_load_info(info)
+
+    # get Parquet jobs
+    completed_jobs = info.load_packages[0].jobs["completed_jobs"]
+    parquet_jobs = [
+        job
+        for job in completed_jobs
+        if job.job_file_info.table_name == "delta_table" and job.file_path.endswith(".parquet")
+    ]
+    assert len(parquet_jobs) == 1
+
+    # get Parquet files in Delta table folder
+    with pipeline.destination_client() as client:
+        assert isinstance(client, FilesystemClient)
+        table_dir = client.get_table_dir("delta_table")
+        parquet_files = [f for f in client.fs_client.ls(table_dir) if f.endswith(".parquet")]
+    assert len(parquet_files) == 1
+
+    # Parquet file should not be the job file
+    file_id = parquet_jobs[0].job_file_info.file_id
+    assert file_id not in parquet_files[0]
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(
+        table_format_filesystem_configs=True,
+        # job orchestration is same across table formats—no need to test all formats
+        with_table_format="delta",
+        bucket_subset=(FILE_BUCKET),
+    ),
+    ids=lambda x: x.name,
+)
+def test_table_format_multiple_files(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """Tests loading multiple files into a table.
+
+    Files should be loaded into the table in a single commit.
     """
 
-    from tests.pipeline.utils import _get_delta_table
+    from dlt.common.libs.deltalake import get_delta_tables
 
     os.environ["DATA_WRITER__FILE_MAX_ITEMS"] = "2"  # force multiple files
 
@@ -349,8 +458,7 @@ def test_delta_table_multiple_files(
     assert len(delta_table_parquet_jobs) == 5  # 10 records, max 2 per file
 
     # all 10 records should have been loaded into a Delta table in a single commit
-    client = cast(FilesystemClient, pipeline.destination_client())
-    assert _get_delta_table(client, "delta_table").version() == 0
+    assert get_delta_tables(pipeline, "delta_table")["delta_table"].version() == 0
     rows = load_tables_to_dicts(pipeline, "delta_table", exclude_system_cols=True)["delta_table"]
     assert len(rows) == 10
 
@@ -358,18 +466,19 @@ def test_delta_table_multiple_files(
 @pytest.mark.parametrize(
     "destination_config",
     destinations_configs(
-        local_filesystem_configs=True,
-        table_format="delta",
+        table_format_filesystem_configs=True,
+        with_table_format=("delta", "iceberg"),
+        bucket_subset=(FILE_BUCKET),
     ),
     ids=lambda x: x.name,
 )
-def test_delta_table_child_tables(
+def test_table_format_child_tables(
     destination_config: DestinationTestConfiguration,
 ) -> None:
-    """Tests child table handling for `delta` table format."""
+    """Tests child table handling for `delta` and `iceberg` table formats."""
 
-    @dlt.resource(table_format="delta")
-    def complex_table():
+    @dlt.resource(table_format=destination_config.table_format)
+    def nested_table():
         yield [
             {
                 "foo": 1,
@@ -385,79 +494,367 @@ def test_delta_table_child_tables(
 
     pipeline = destination_config.setup_pipeline("fs_pipe", dev_mode=True)
 
-    info = pipeline.run(complex_table())
+    info = pipeline.run(nested_table())
     assert_load_info(info)
     rows_dict = load_tables_to_dicts(
         pipeline,
-        "complex_table",
-        "complex_table__child",
-        "complex_table__child__grandchild",
+        "nested_table",
+        "nested_table__child",
+        "nested_table__child__grandchild",
         exclude_system_cols=True,
     )
     # assert row counts
-    assert len(rows_dict["complex_table"]) == 2
-    assert len(rows_dict["complex_table__child"]) == 3
-    assert len(rows_dict["complex_table__child__grandchild"]) == 5
+    assert len(rows_dict["nested_table"]) == 2
+    assert len(rows_dict["nested_table__child"]) == 3
+    assert len(rows_dict["nested_table__child__grandchild"]) == 5
     # assert column names
-    assert rows_dict["complex_table"][0].keys() == {"foo"}
-    assert rows_dict["complex_table__child"][0].keys() == {"bar"}
-    assert rows_dict["complex_table__child__grandchild"][0].keys() == {"value"}
+    assert rows_dict["nested_table"][0].keys() == {"foo"}
+    assert rows_dict["nested_table__child"][0].keys() == {"bar"}
+    assert rows_dict["nested_table__child__grandchild"][0].keys() == {"value"}
 
     # test write disposition handling with child tables
-    info = pipeline.run(complex_table())
+    info = pipeline.run(nested_table())
     assert_load_info(info)
     rows_dict = load_tables_to_dicts(
         pipeline,
-        "complex_table",
-        "complex_table__child",
-        "complex_table__child__grandchild",
+        "nested_table",
+        "nested_table__child",
+        "nested_table__child__grandchild",
         exclude_system_cols=True,
     )
-    assert len(rows_dict["complex_table"]) == 2 * 2
-    assert len(rows_dict["complex_table__child"]) == 3 * 2
-    assert len(rows_dict["complex_table__child__grandchild"]) == 5 * 2
+    assert len(rows_dict["nested_table"]) == 2 * 2
+    assert len(rows_dict["nested_table__child"]) == 3 * 2
+    assert len(rows_dict["nested_table__child__grandchild"]) == 5 * 2
 
-    info = pipeline.run(complex_table(), write_disposition="replace")
+    info = pipeline.run(nested_table(), write_disposition="replace")
     assert_load_info(info)
     rows_dict = load_tables_to_dicts(
         pipeline,
-        "complex_table",
-        "complex_table__child",
-        "complex_table__child__grandchild",
+        "nested_table",
+        "nested_table__child",
+        "nested_table__child__grandchild",
         exclude_system_cols=True,
     )
-    assert len(rows_dict["complex_table"]) == 2
-    assert len(rows_dict["complex_table__child"]) == 3
-    assert len(rows_dict["complex_table__child__grandchild"]) == 5
+    assert len(rows_dict["nested_table"]) == 2
+    assert len(rows_dict["nested_table__child"]) == 3
+    assert len(rows_dict["nested_table__child__grandchild"]) == 5
+
+    if destination_config.supports_merge:
+        # now drop children and grandchildren, use merge write disposition to create and pass full table chain
+        # also for tables that do not have jobs
+        info = pipeline.run(
+            [{"foo": 3}] * 10000,
+            table_name="nested_table",
+            primary_key="foo",
+            write_disposition="merge",
+        )
+        assert_load_info(info)
 
 
 @pytest.mark.parametrize(
     "destination_config",
     destinations_configs(
-        local_filesystem_configs=True,
-        table_format="delta",
+        table_format_filesystem_configs=True,
+        with_table_format=("delta", "iceberg"),
+        bucket_subset=(FILE_BUCKET),
     ),
     ids=lambda x: x.name,
 )
-def test_delta_table_empty_source(
+def test_table_format_partitioning(
     destination_config: DestinationTestConfiguration,
 ) -> None:
-    """Tests empty source handling for `delta` table format.
+    """Tests partitioning for `delta` and `iceberg` table formats."""
+
+    from tests.pipeline.utils import users_materialize_table_schema
+
+    def assert_partition_columns(
+        table_name: str, table_format: TTableFormat, expected_partition_columns: List[str]
+    ) -> None:
+        if table_format == "delta":
+            from dlt.common.libs.deltalake import get_delta_tables
+
+            dt = get_delta_tables(pipeline, table_name)[table_name]
+            actual_partition_columns = dt.metadata().partition_columns
+        elif table_format == "iceberg":
+            from dlt.common.libs.pyiceberg import get_iceberg_tables
+
+            it = get_iceberg_tables(pipeline, table_name)[table_name]
+            actual_partition_columns = [f.name for f in it.metadata.specs_struct().fields]
+        assert actual_partition_columns == expected_partition_columns
+
+    pipeline = destination_config.setup_pipeline("fs_pipe", dev_mode=True)
+
+    # zero partition columns
+    @dlt.resource(table_format=destination_config.table_format)
+    def zero_part():
+        yield {"foo": 1, "bar": 1}
+
+    info = pipeline.run(zero_part())
+    assert_load_info(info)
+    assert_partition_columns("zero_part", destination_config.table_format, [])
+    assert load_table_counts(pipeline, "zero_part")["zero_part"] == 1
+
+    # one partition column
+    @dlt.resource(table_format=destination_config.table_format, columns={"c1": {"partition": True}})
+    def one_part():
+        yield [
+            {"c1": "foo", "c2": 1},
+            {"c1": "foo", "c2": 2},
+            {"c1": "bar", "c2": 3},
+            {"c1": "baz", "c2": 4},
+        ]
+
+    info = pipeline.run(one_part())
+    assert_load_info(info)
+    assert_partition_columns("one_part", destination_config.table_format, ["c1"])
+    assert load_table_counts(pipeline, "one_part")["one_part"] == 4
+
+    # two partition columns
+    @dlt.resource(
+        table_format=destination_config.table_format,
+        columns={"c1": {"partition": True}, "c2": {"partition": True}},
+    )
+    def two_part():
+        yield [
+            {"c1": "foo", "c2": 1, "c3": True},
+            {"c1": "foo", "c2": 2, "c3": True},
+            {"c1": "bar", "c2": 1, "c3": True},
+            {"c1": "baz", "c2": 1, "c3": True},
+        ]
+
+    info = pipeline.run(two_part())
+    assert_load_info(info)
+    assert_partition_columns("two_part", destination_config.table_format, ["c1", "c2"])
+    assert load_table_counts(pipeline, "two_part")["two_part"] == 4
+
+    # test partitioning with empty source
+    users_materialize_table_schema.apply_hints(
+        table_format=destination_config.table_format,
+        columns={"id": {"partition": True}},
+    )
+    info = pipeline.run(users_materialize_table_schema())
+    assert_load_info(info)
+    assert_partition_columns("users", destination_config.table_format, ["id"])
+    assert load_table_counts(pipeline, "users")["users"] == 0
+
+    # changing partitioning after initial table creation is not supported
+    zero_part.apply_hints(columns={"foo": {"partition": True}})
+    if destination_config.table_format == "delta":
+        # Delta raises error when trying to change partitioning
+        with pytest.raises(PipelineStepFailed) as pip_ex:
+            pipeline.run(zero_part())
+        assert isinstance(pip_ex.value.__context__, LoadClientJobRetry)
+        assert "partitioning" in pip_ex.value.__context__.retry_message
+    elif destination_config.table_format == "iceberg":
+        # while Iceberg supports partition evolution, we don't apply it
+        pipeline.run(zero_part())
+    assert_partition_columns("zero_part", destination_config.table_format, [])
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(
+        table_format_filesystem_configs=True,
+        with_table_format="delta",
+        bucket_subset=(FILE_BUCKET),
+    ),
+    ids=lambda x: x.name,
+)
+def test_delta_table_partitioning_arrow_load_id(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """Tests partitioning on load id column added by Arrow normalizer.
+
+    Case needs special handling because of bug in delta-rs:
+    https://github.com/delta-io/delta-rs/issues/2969
+    """
+    from dlt.common.libs.pyarrow import pyarrow
+    from dlt.common.libs.deltalake import get_delta_tables
+
+    os.environ["NORMALIZE__PARQUET_NORMALIZER__ADD_DLT_LOAD_ID"] = "true"
+
+    pipeline = destination_config.setup_pipeline("fs_pipe", dev_mode=True)
+
+    # append write disposition
+    info = pipeline.run(
+        pyarrow.table({"foo": [1]}),
+        table_name="delta_table",
+        columns={"_dlt_load_id": {"partition": True}},
+        table_format="delta",
+    )
+    assert_load_info(info)
+    dt = get_delta_tables(pipeline, "delta_table")["delta_table"]
+    assert dt.metadata().partition_columns == ["_dlt_load_id"]
+    assert load_table_counts(pipeline, "delta_table")["delta_table"] == 1
+
+    # merge write disposition
+    info = pipeline.run(
+        pyarrow.table({"foo": [1, 2]}),
+        table_name="delta_table",
+        write_disposition={"disposition": "merge", "strategy": "upsert"},
+        columns={"_dlt_load_id": {"partition": True}},
+        primary_key="foo",
+        table_format="delta",
+    )
+    assert_load_info(info)
+    dt = get_delta_tables(pipeline, "delta_table")["delta_table"]
+    assert dt.metadata().partition_columns == ["_dlt_load_id"]
+    assert load_table_counts(pipeline, "delta_table")["delta_table"] == 2
+
+
+@pytest.mark.essential
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(
+        table_format_filesystem_configs=True,
+        with_table_format=("delta", "iceberg"),
+        bucket_subset=(FILE_BUCKET),
+    ),
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize(
+    "write_disposition",
+    (
+        "append",
+        "replace",
+        pytest.param({"disposition": "merge", "strategy": "upsert"}, id="upsert"),
+    ),
+)
+def test_table_format_schema_evolution(
+    destination_config: DestinationTestConfiguration,
+    write_disposition: TWriteDisposition,
+) -> None:
+    """Tests schema evolution (adding new columns) for `delta` and `iceberg` table formats."""
+    if destination_config.table_format == "iceberg" and write_disposition == {
+        "disposition": "merge",
+        "strategy": "upsert",
+    }:
+        pytest.skip("`upsert` currently not implemented for `iceberg`")
+
+    from dlt.common.libs.pyarrow import pyarrow
+
+    @dlt.resource(
+        write_disposition=write_disposition,
+        primary_key="pk",
+        table_format=destination_config.table_format,
+    )
+    def evolving_table(data):
+        yield data
+
+    pipeline = destination_config.setup_pipeline("fs_pipe", dev_mode=True)
+
+    # create Arrow table with one column, one row
+    pk_field = pyarrow.field("pk", pyarrow.int64(), nullable=False)
+    schema = pyarrow.schema([pk_field])
+    arrow_table = pyarrow.Table.from_pydict({"pk": [1]}, schema=schema)
+    assert arrow_table.shape == (1, 1)
+
+    # initial load
+    info = pipeline.run(evolving_table(arrow_table))
+    assert_load_info(info)
+    expected, actual = get_expected_actual(
+        pipeline, "evolving_table", destination_config.table_format, arrow_table
+    )
+    assert actual.equals(expected)
+
+    # create Arrow table with many columns, two rows
+    arrow_table = arrow_table_all_data_types(
+        "arrow-table",
+        include_decimal_default_precision=True,
+        include_decimal_arrow_max_precision=True,
+        include_not_normalized_name=False,
+        include_null=False,
+        num_rows=2,
+    )[0]
+    arrow_table = arrow_table.add_column(0, pk_field, [[1, 2]])
+
+    # second load — this should evolve the schema (i.e. add the new columns)
+    info = pipeline.run(evolving_table(arrow_table))
+    assert_load_info(info)
+    expected, actual = get_expected_actual(
+        pipeline, "evolving_table", destination_config.table_format, arrow_table
+    )
+    if write_disposition == "append":
+        # just check shape and schema for `append`, because table comparison is
+        # more involved than with the other dispositions
+        assert actual.num_rows == 3
+        actual.schema.equals(expected.schema)
+    else:
+        assert actual.sort_by("pk").equals(expected.sort_by("pk"))
+
+    # create empty Arrow table with additional column
+    arrow_table = arrow_table.append_column(
+        pyarrow.field("another_new_column", pyarrow.string()),
+        [["foo", "foo"]],
+    )
+    empty_arrow_table = arrow_table.schema.empty_table()
+
+    # load 3 — this should evolve the schema without changing data
+    info = pipeline.run(evolving_table(empty_arrow_table))
+    assert_load_info(info)
+    expected, actual = get_expected_actual(
+        pipeline, "evolving_table", destination_config.table_format, arrow_table
+    )
+    assert actual.schema.equals(expected.schema)
+    if write_disposition == "append":
+        expected_num_rows = 3
+    elif write_disposition == "replace":
+        expected_num_rows = 0
+        if destination_config.table_format == "delta":
+            # TODO: fix https://github.com/dlt-hub/dlt/issues/2092 and remove this if-clause
+            expected_num_rows = 2
+    elif write_disposition == {"disposition": "merge", "strategy": "upsert"}:
+        expected_num_rows = 2
+    assert actual.num_rows == expected_num_rows
+    # new column should have NULLs only
+    assert (
+        actual.column("another_new_column").combine_chunks().to_pylist()
+        == [None] * expected_num_rows
+    )
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(
+        table_format_filesystem_configs=True,
+        with_table_format=("delta", "iceberg"),
+        bucket_subset=(FILE_BUCKET, AZ_BUCKET),
+    ),
+    ids=lambda x: x.name,
+)
+def test_table_format_empty_source(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """Tests empty source handling for `delta` and `iceberg` table formats.
 
     Tests both empty Arrow table and `dlt.mark.materialize_table_schema()`.
     """
-    from dlt.common.libs.pyarrow import pyarrow as pa
-    from dlt.common.libs.deltalake import ensure_delta_compatible_arrow_data
-    from tests.pipeline.utils import _get_delta_table, users_materialize_table_schema
+    from tests.pipeline.utils import users_materialize_table_schema
 
-    @dlt.resource(table_format="delta")
-    def delta_table(data):
+    def get_table_version(  # type: ignore[return]
+        pipeline: dlt.Pipeline,
+        table_name: str,
+        table_format: TTableFormat,
+    ) -> int:
+        if table_format == "delta":
+            from dlt.common.libs.deltalake import get_delta_tables
+
+            dt = get_delta_tables(pipeline, table_name)[table_name]
+            return dt.version()
+        elif table_format == "iceberg":
+            from dlt.common.libs.pyiceberg import get_iceberg_tables
+
+            it = get_iceberg_tables(pipeline, table_name)[table_name]
+            return it.last_sequence_number - 1  # subtract 1 to match `delta`
+
+    @dlt.resource(table_format=destination_config.table_format)
+    def a_table(data):
         yield data
 
     # create empty Arrow table with schema
     arrow_table = arrow_table_all_data_types(
         "arrow-table",
-        include_decimal_default_precision=False,
+        include_decimal_default_precision=True,
         include_decimal_arrow_max_precision=True,
         include_not_normalized_name=False,
         include_null=False,
@@ -471,65 +868,62 @@ def test_delta_table_empty_source(
 
     # run 1: empty Arrow table with schema
     # this should create empty Delta table with same schema as Arrow table
-    info = pipeline.run(delta_table(empty_arrow_table))
+    info = pipeline.run(a_table(empty_arrow_table))
     assert_load_info(info)
-    client = cast(FilesystemClient, pipeline.destination_client())
-    dt = _get_delta_table(client, "delta_table")
-    assert dt.version() == 0
-    dt_arrow_table = dt.to_pyarrow_table()
-    assert dt_arrow_table.shape == (0, empty_arrow_table.num_columns)
-    assert dt_arrow_table.schema.equals(
-        ensure_delta_compatible_arrow_data(empty_arrow_table).schema
+    assert get_table_version(pipeline, "a_table", destination_config.table_format) == 0
+    expected, actual = get_expected_actual(
+        pipeline, "a_table", destination_config.table_format, empty_arrow_table
     )
+    assert actual.shape == (0, expected.num_columns)
+    assert actual.schema.equals(expected.schema)
 
     # run 2: non-empty Arrow table with same schema as run 1
     # this should load records into Delta table
-    info = pipeline.run(delta_table(arrow_table))
+    info = pipeline.run(a_table(arrow_table))
     assert_load_info(info)
-    dt = _get_delta_table(client, "delta_table")
-    assert dt.version() == 1
-    dt_arrow_table = dt.to_pyarrow_table()
-    assert dt_arrow_table.shape == (2, empty_arrow_table.num_columns)
-    assert dt_arrow_table.schema.equals(
-        ensure_delta_compatible_arrow_data(empty_arrow_table).schema
+    assert get_table_version(pipeline, "a_table", destination_config.table_format) == 1
+    expected, actual = get_expected_actual(
+        pipeline, "a_table", destination_config.table_format, empty_arrow_table
     )
+    assert actual.shape == (2, expected.num_columns)
+    assert actual.schema.equals(expected.schema)
 
-    # run 3: empty Arrow table with different schema
-    # this should not alter the Delta table
-    empty_arrow_table_2 = pa.schema(
-        [pa.field("foo", pa.int64()), pa.field("bar", pa.string())]
-    ).empty_table()
-
-    info = pipeline.run(delta_table(empty_arrow_table_2))
+    # now run the empty frame again
+    info = pipeline.run(a_table(empty_arrow_table))
     assert_load_info(info)
-    dt = _get_delta_table(client, "delta_table")
-    assert dt.version() == 1  # still 1, no new commit was done
-    dt_arrow_table = dt.to_pyarrow_table()
-    assert dt_arrow_table.shape == (2, empty_arrow_table.num_columns)  # shape did not change
-    assert dt_arrow_table.schema.equals(  # schema did not change
-        ensure_delta_compatible_arrow_data(empty_arrow_table).schema
-    )
+
+    if destination_config.table_format == "delta":
+        # use materialized list
+        # NOTE: this will create an empty parquet file with a schema takes from dlt schema.
+        # the original parquet file had a nested (struct) type in `json` field that is now
+        # in the delta table schema. the empty parquet file lost this information and had
+        # string type (converted from dlt `json`)
+        info = pipeline.run([dlt.mark.materialize_table_schema()], table_name="a_table")
+        assert_load_info(info)
 
     # test `dlt.mark.materialize_table_schema()`
-    users_materialize_table_schema.apply_hints(table_format="delta")
-    info = pipeline.run(users_materialize_table_schema())
+    users_materialize_table_schema.apply_hints(table_format=destination_config.table_format)
+    info = pipeline.run(users_materialize_table_schema(), loader_file_format="parquet")
     assert_load_info(info)
-    dt = _get_delta_table(client, "users")
-    assert dt.version() == 0
-    dt_arrow_table = dt.to_pyarrow_table()
-    assert dt_arrow_table.num_rows == 0
-    assert "id", "name" == dt_arrow_table.schema.names[:2]
+    assert get_table_version(pipeline, "users", destination_config.table_format) == 0
+    _, actual = get_expected_actual(
+        pipeline, "users", destination_config.table_format, empty_arrow_table
+    )
+    assert actual.num_rows == 0
+    assert "id", "name" == actual.schema.names[:2]
 
 
 @pytest.mark.parametrize(
     "destination_config",
     destinations_configs(
-        local_filesystem_configs=True,
-        table_format="delta",
+        table_format_filesystem_configs=True,
+        # job orchestration is same across table formats—no need to test all formats
+        with_table_format="delta",
+        bucket_subset=(FILE_BUCKET),
     ),
     ids=lambda x: x.name,
 )
-def test_delta_table_mixed_source(
+def test_table_format_mixed_source(
     destination_config: DestinationTestConfiguration,
 ) -> None:
     """Tests file format handling in mixed source.
@@ -572,12 +966,14 @@ def test_delta_table_mixed_source(
 @pytest.mark.parametrize(
     "destination_config",
     destinations_configs(
-        local_filesystem_configs=True,
-        table_format="delta",
+        table_format_filesystem_configs=True,
+        # job orchestration is same across table formats—no need to test all formats
+        with_table_format="delta",
+        bucket_subset=(FILE_BUCKET),
     ),
     ids=lambda x: x.name,
 )
-def test_delta_table_dynamic_dispatch(
+def test_table_format_dynamic_dispatch(
     destination_config: DestinationTestConfiguration,
 ) -> None:
     @dlt.resource(primary_key="id", table_name=lambda i: i["type"], table_format="delta")
@@ -594,6 +990,147 @@ def test_delta_table_dynamic_dispatch(
     completed_jobs = info.load_packages[0].jobs["completed_jobs"]
     # 20 event types, two jobs per table (.parquet and .reference), 1 job for _dlt_pipeline_state
     assert len(completed_jobs) == 2 * 20 + 1
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(
+        table_format_filesystem_configs=True,
+        with_table_format=("delta", "iceberg"),
+        bucket_subset=(FILE_BUCKET, AZ_BUCKET),
+    ),
+    ids=lambda x: x.name,
+)
+def test_table_format_get_tables_helper(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """Tests `get_delta_tables` / `get_iceberg_tables` helper functions."""
+    get_tables: Any
+    if destination_config.table_format == "delta":
+        from dlt.common.libs.deltalake import DeltaTable, get_delta_tables
+
+        get_tables = get_delta_tables
+        get_num_rows = lambda table: table.to_pyarrow_table().num_rows
+    elif destination_config.table_format == "iceberg":
+        from dlt.common.libs.pyiceberg import IcebergTable, get_iceberg_tables
+
+        get_tables = get_iceberg_tables
+        get_num_rows = lambda table: table.scan().to_arrow().num_rows
+
+    @dlt.resource(table_format=destination_config.table_format)
+    def foo_table_format():
+        yield [{"foo": 1}, {"foo": 2}]
+
+    @dlt.resource(table_format=destination_config.table_format)
+    def bar_table_format():
+        yield [{"bar": 1}]
+
+    @dlt.resource
+    def baz_not_table_format():
+        yield [{"baz": 1}]
+
+    pipeline = destination_config.setup_pipeline("fs_pipe", dev_mode=True)
+
+    info = pipeline.run(foo_table_format())
+    assert_load_info(info)
+    tables = get_tables(pipeline)
+    assert tables.keys() == {"foo_table_format"}
+    if destination_config.table_format == "delta":
+        assert isinstance(tables["foo_table_format"], DeltaTable)
+    elif destination_config.table_format == "iceberg":
+        assert isinstance(tables["foo_table_format"], IcebergTable)
+    assert get_num_rows(tables["foo_table_format"]) == 2
+
+    info = pipeline.run([foo_table_format(), bar_table_format(), baz_not_table_format()])
+    assert_load_info(info)
+    tables = get_tables(pipeline)
+    assert tables.keys() == {"foo_table_format", "bar_table_format"}
+    assert get_num_rows(tables["bar_table_format"]) == 1
+    assert get_tables(pipeline, "foo_table_format").keys() == {"foo_table_format"}
+    assert get_tables(pipeline, "bar_table_format").keys() == {"bar_table_format"}
+    assert get_tables(pipeline, "foo_table_format", "bar_table_format").keys() == {
+        "foo_table_format",
+        "bar_table_format",
+    }
+
+    # test with child table
+    @dlt.resource(table_format=destination_config.table_format)
+    def parent_table_format():
+        yield [{"foo": 1, "child": [1, 2, 3]}]
+
+    info = pipeline.run(parent_table_format())
+    assert_load_info(info)
+    tables = get_tables(pipeline)
+    assert "parent_table_format__child" in tables.keys()
+    assert get_num_rows(tables["parent_table_format__child"]) == 3
+
+    # test invalid input
+    with pytest.raises(ValueError):
+        get_tables(pipeline, "baz_not_table_format")
+
+    with pytest.raises(ValueError):
+        get_tables(pipeline, "non_existing_table")
+
+    # test unknown schema
+    with pytest.raises(FileNotFoundError):
+        get_tables(pipeline, "non_existing_table", schema_name="aux_2")
+
+    # load to a new schema and under new name
+    aux_schema = dlt.Schema("aux_2")
+    # NOTE: you cannot have a file with name
+    info = pipeline.run(parent_table_format().with_name("aux_table"), schema=aux_schema)
+    # also state in seprate package
+    assert_load_info(info, expected_load_packages=2)
+    tables = get_tables(pipeline, schema_name="aux_2")
+    assert "aux_table__child" in tables.keys()
+    get_tables(pipeline, "aux_table", schema_name="aux_2")
+    with pytest.raises(ValueError):
+        get_tables(pipeline, "aux_table")
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(
+        table_format_filesystem_configs=True,
+        with_table_format="delta",
+        bucket_subset=(FILE_BUCKET),
+    ),
+    ids=lambda x: x.name,
+)
+def test_parquet_to_delta_upgrade(destination_config: DestinationTestConfiguration):
+    # change the resource to start creating delta tables
+    from dlt.common.libs.deltalake import get_delta_tables
+
+    @dlt.resource()
+    def foo():
+        yield [{"foo": 1}, {"foo": 2}]
+
+    pipeline = destination_config.setup_pipeline("fs_pipe")
+
+    info = pipeline.run(foo())
+    assert_load_info(info)
+    delta_tables = get_delta_tables(pipeline)
+    assert set(delta_tables.keys()) == set()
+
+    # drop the pipeline
+    pipeline.deactivate()
+
+    # redefine the resource
+
+    @dlt.resource(table_format="delta")  # type: ignore
+    def foo():
+        yield [{"foo": 1}, {"foo": 2}]
+
+    pipeline = destination_config.setup_pipeline("fs_pipe")
+
+    info = pipeline.run(foo())
+    assert_load_info(info)
+    delta_tables = get_delta_tables(pipeline)
+    assert set(delta_tables.keys()) == {"foo"}
+
+    # optimize all delta tables to make sure storage is there
+    for table in delta_tables.values():
+        table.vacuum()
 
 
 TEST_LAYOUTS = (
@@ -759,8 +1296,8 @@ def test_state_files(destination_config: DestinationTestConfiguration) -> None:
         "_dlt_pipeline_state": 2,
         "_dlt_version": 2,
     }
-    sc1_old = c1.get_stored_schema()
-    sc2_old = c2.get_stored_schema()
+    sc1_old = c1.get_stored_schema(c1.schema.name)
+    sc2_old = c2.get_stored_schema(c2.schema.name)
     s1_old = c1.get_stored_state("p1")
     s2_old = c1.get_stored_state("p2")
 
@@ -797,8 +1334,8 @@ def test_state_files(destination_config: DestinationTestConfiguration) -> None:
     assert s2_old.version == s2.version
 
     # test accessors for schema
-    sc1 = c1.get_stored_schema()
-    sc2 = c2.get_stored_schema()
+    sc1 = c1.get_stored_schema(c1.schema.name)
+    sc2 = c2.get_stored_schema(c2.schema.name)
     assert sc1.version_hash != sc1_old.version_hash
     assert sc2.version_hash == sc2_old.version_hash
     assert sc1.version_hash != sc2.version_hash
@@ -960,3 +1497,186 @@ def test_client_methods(
     # test truncate multiple
     fs_client.truncate_tables(["table_1", "table_3"])
     assert load_table_counts(p, "table_1", "table_2", "table_3") == {"table_2": 21}
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(all_buckets_filesystem_configs=True),
+    ids=lambda x: x.name,
+)
+def test_cleanup_states_by_load_id(destination_config: DestinationTestConfiguration) -> None:
+    """
+    Test the pipeline state cleanup functionality by verifying that old state files are removed based on `load_id` when multiple loads are executed.
+
+    Specifically, the oldest state file (corresponding to the first `load_id`) should be deleted.
+
+    This test checks that when running a pipeline with a resource that produces incremental data, older state files are cleared according to the `max_state_files` setting.
+
+    Steps:
+    1. Set `max_state_files` to 2, allowing only two newest state files to be kept.
+    2. Run the pipeline three times.
+    3. Verify that the state file from the first load is no longer present in the state table.
+    """
+
+    dataset_name = f"{destination_config.destination_name}{uniq_id()}"
+    p = destination_config.setup_pipeline("p1", dataset_name=dataset_name)
+
+    @dlt.resource(name="items", primary_key="id")
+    def r1(_=dlt.sources.incremental("id")):
+        yield from [{"id": 0}]
+
+    @dlt.resource(name="items", primary_key="id")
+    def r2(_=dlt.sources.incremental("id")):
+        yield from [{"id": 0}, {"id": 1}]
+
+    @dlt.resource(name="items", primary_key="id")
+    def r3(_=dlt.sources.incremental("id")):
+        yield from [{"id": 0}, {"id": 1}, {"id": 2}]
+
+    os.environ["DESTINATION__FILESYSTEM__MAX_STATE_FILES"] = str(2)
+
+    info = p.run(r1)
+    first_load_id = info.loads_ids[0]
+
+    info = p.run(r2)
+    second_load_id = [load_id for load_id in info.loads_ids if load_id != first_load_id][0]
+
+    info = p.run(r3)
+    third_load_id = [
+        load_id
+        for load_id in info.loads_ids
+        if load_id != first_load_id and load_id != second_load_id
+    ][0]
+
+    client: FilesystemClient = p.destination_client()  # type: ignore
+    state_table_files = list(client._list_dlt_table_files(client.schema.state_table_name, "p1"))
+
+    assert not any(fileparts[1] == first_load_id for _, fileparts in state_table_files)
+    assert any(fileparts[1] == second_load_id for _, fileparts in state_table_files)
+    assert any(fileparts[1] == third_load_id for _, fileparts in state_table_files)
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(all_buckets_filesystem_configs=True),
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize("max_state_files", [-1, 0, 1, 3])
+def test_cleanup_states(
+    destination_config: DestinationTestConfiguration, max_state_files: int
+) -> None:
+    """
+    Test the behavior of pipeline state cleanup based on different max_state_files configurations.
+
+    Steps:
+    1. Run the pipeline five times with max_state_files set to -1, 0, 1, and 3.
+    2. Verify that state files are cleaned or retained according to the max_state_files setting:
+        - Negative or zero values disable cleanup.
+        - Positive values trigger cleanup, keeping only the specified number of state files.
+    """
+    os.environ["DESTINATION__FILESYSTEM__MAX_STATE_FILES"] = str(max_state_files)
+
+    dataset_name = f"{destination_config.destination_name}{uniq_id()}"
+    p = destination_config.setup_pipeline("p1", dataset_name=dataset_name)
+
+    @dlt.resource(name="items", primary_key="id")
+    def r1(_=dlt.sources.incremental("id")):
+        yield from [{"id": 0}]
+
+    @dlt.resource(name="items", primary_key="id")
+    def r2(_=dlt.sources.incremental("id")):
+        yield from [{"id": 0}, {"id": 1}]
+
+    @dlt.resource(name="items", primary_key="id")
+    def r3(_=dlt.sources.incremental("id")):
+        yield from [{"id": 0}, {"id": 1}, {"id": 2}]
+
+    @dlt.resource(name="items", primary_key="id")
+    def r4(_=dlt.sources.incremental("id")):
+        yield from [{"id": 0}, {"id": 1}, {"id": 2}, {"id": 3}]
+
+    @dlt.resource(name="items", primary_key="id")
+    def r5(_=dlt.sources.incremental("id")):
+        yield from [{"id": 0}, {"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
+
+    # run pipeline
+    run_count = 5
+
+    p.run(r1)
+    p.run(r2)
+    p.run(r3)
+    p.run(r4)
+    p.run(r5)
+
+    client: FilesystemClient = p.destination_client()  # type: ignore
+    state_table_files = list(client._list_dlt_table_files(client.schema.state_table_name, "p1"))
+
+    if max_state_files == -1 or max_state_files == 0:
+        assert len(state_table_files) == run_count
+    else:
+        assert len(state_table_files) == max_state_files
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(all_buckets_filesystem_configs=True),
+    ids=lambda x: x.name,
+)
+def test_cleanup_states_shared_dataset(destination_config: DestinationTestConfiguration) -> None:
+    """
+    Test that two pipelines sharing the same bucket_url and dataset_name can independently
+    clean their _dlt_pipeline_state files with different max_state_files configurations.
+
+    Steps:
+    1. Run pipeline p1 five times with max_state_files set to 5.
+    2. Run pipeline p2 five times with max_state_files set to 2.
+    3. Verify that each pipeline only deletes its own state files and does not affect the other.
+    """
+    dataset_name = f"{destination_config.destination_name}{uniq_id()}"
+
+    p1 = destination_config.setup_pipeline("p1", dataset_name=dataset_name)
+    p2 = destination_config.setup_pipeline("p2", dataset_name=dataset_name)
+
+    @dlt.resource(name="items", primary_key="id")
+    def r1(_=dlt.sources.incremental("id")):
+        yield from [{"id": 0}]
+
+    @dlt.resource(name="items", primary_key="id")
+    def r2(_=dlt.sources.incremental("id")):
+        yield from [{"id": 0}, {"id": 1}]
+
+    @dlt.resource(name="items", primary_key="id")
+    def r3(_=dlt.sources.incremental("id")):
+        yield from [{"id": 0}, {"id": 1}, {"id": 2}]
+
+    @dlt.resource(name="items", primary_key="id")
+    def r4(_=dlt.sources.incremental("id")):
+        yield from [{"id": 0}, {"id": 1}, {"id": 2}, {"id": 3}]
+
+    @dlt.resource(name="items", primary_key="id")
+    def r5(_=dlt.sources.incremental("id")):
+        yield from [{"id": 0}, {"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
+
+    os.environ["DESTINATION__FILESYSTEM__MAX_STATE_FILES"] = str(5)
+    p1.run(r1)
+    p1.run(r2)
+    p1.run(r3)
+    p1.run(r4)
+    p1.run(r5)
+
+    os.environ["DESTINATION__FILESYSTEM__MAX_STATE_FILES"] = str(2)
+    p2.run(r1)
+    p2.run(r2)
+    p2.run(r3)
+    p2.run(r4)
+    p2.run(r5)
+
+    p1_client: FilesystemClient = p1.destination_client()  # type: ignore
+    p1_state_files = list(p1_client._list_dlt_table_files(p1_client.schema.state_table_name, "p1"))
+
+    p2_client: FilesystemClient = p2.destination_client()  # type: ignore
+    p2_state_files = list(p2_client._list_dlt_table_files(p2_client.schema.state_table_name, "p2"))
+
+    assert len(p1_state_files) == 5
+
+    assert len(p2_state_files) == 2

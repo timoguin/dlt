@@ -1,7 +1,21 @@
 from contextlib import contextmanager, suppress
-from typing import Any, AnyStr, ClassVar, Iterator, Optional, Sequence, List, Tuple, Union, Dict
+from typing import (
+    Any,
+    AnyStr,
+    ClassVar,
+    Generator,
+    Iterator,
+    Optional,
+    Sequence,
+    List,
+    Tuple,
+    Union,
+    Dict,
+    cast,
+    Callable,
+)
 
-
+from databricks.sdk.core import Config, oauth_service_principal
 from databricks import sql as databricks_lib
 from databricks.sql.client import (
     Connection as DatabricksSqlConnection,
@@ -21,25 +35,30 @@ from dlt.destinations.sql_client import (
     raise_database_error,
     raise_open_connection_error,
 )
-from dlt.destinations.typing import DBApi, DBApiCursor, DBTransaction, DataFrame
+from dlt.destinations.typing import ArrowTable, DBApi, DBTransaction, DataFrame
 from dlt.destinations.impl.databricks.configuration import DatabricksCredentials
+from dlt.common.destination.reference import DBApiCursor
 
 
 class DatabricksCursorImpl(DBApiCursorImpl):
     """Use native data frame support if available"""
 
-    native_cursor: DatabricksSqlCursor  # type: ignore[assignment]
-    vector_size: ClassVar[int] = 2048
+    native_cursor: DatabricksSqlCursor  # type: ignore[assignment, unused-ignore]
+    vector_size: ClassVar[int] = 2048  # vector size is 2048
 
-    def df(self, chunk_size: int = None, **kwargs: Any) -> DataFrame:
+    def iter_arrow(self, chunk_size: int) -> Generator[ArrowTable, None, None]:
         if chunk_size is None:
-            return self.native_cursor.fetchall_arrow().to_pandas()
-        else:
-            df = self.native_cursor.fetchmany_arrow(chunk_size).to_pandas()
-            if df.shape[0] == 0:
-                return None
-            else:
-                return df
+            yield self.native_cursor.fetchall_arrow()
+            return
+        while True:
+            table = self.native_cursor.fetchmany_arrow(chunk_size)
+            if table.num_rows == 0:
+                return
+            yield table
+
+    def iter_df(self, chunk_size: int) -> Generator[DataFrame, None, None]:
+        for table in self.iter_arrow(chunk_size=chunk_size):
+            yield table.to_pandas()
 
 
 class DatabricksSqlClient(SqlClientBase[DatabricksSqlConnection], DBTransaction):
@@ -56,8 +75,22 @@ class DatabricksSqlClient(SqlClientBase[DatabricksSqlConnection], DBTransaction)
         self._conn: DatabricksSqlConnection = None
         self.credentials = credentials
 
+    def _get_oauth_credentials(self) -> Optional[Callable[[], Dict[str, str]]]:
+        config = Config(
+            host=f"https://{self.credentials.server_hostname}",
+            client_id=self.credentials.client_id,
+            client_secret=self.credentials.client_secret,
+        )
+        return cast(Callable[[], Dict[str, str]], oauth_service_principal(config))
+
     def open_connection(self) -> DatabricksSqlConnection:
         conn_params = self.credentials.to_connector_params()
+
+        if self.credentials.client_id and self.credentials.client_secret:
+            conn_params["credentials_provider"] = self._get_oauth_credentials
+        else:
+            conn_params["access_token"] = self.credentials.access_token
+
         self._conn = databricks_lib.connect(
             **conn_params, schema=self.dataset_name, use_inline_params="silent"
         )
@@ -107,7 +140,6 @@ class DatabricksSqlClient(SqlClientBase[DatabricksSqlConnection], DBTransaction)
     @contextmanager
     @raise_database_error
     def execute_query(self, query: AnyStr, *args: Any, **kwargs: Any) -> Iterator[DBApiCursor]:
-        curr: DBApiCursor
         # TODO: Inline param support will be dropped in future databricks driver, switch to :named paramstyle
         # This will drop support for cluster runtime v13.x
         # db_args: Optional[Dict[str, Any]]
@@ -126,10 +158,11 @@ class DatabricksSqlClient(SqlClientBase[DatabricksSqlConnection], DBTransaction)
         # else:
         #     db_args = kwargs or None
 
+        assert isinstance(query, str)
         db_args = args or kwargs or None
-        with self._conn.cursor() as curr:  # type: ignore[assignment]
+        with self._conn.cursor() as curr:
             curr.execute(query, db_args)
-            yield DatabricksCursorImpl(curr)  # type: ignore[abstract]
+            yield DatabricksCursorImpl(curr)  # type: ignore[arg-type, abstract, unused-ignore]
 
     def catalog_name(self, escape: bool = True) -> Optional[str]:
         catalog = self.capabilities.casefold_identifier(self.credentials.catalog)
@@ -148,7 +181,7 @@ class DatabricksSqlClient(SqlClientBase[DatabricksSqlConnection], DBTransaction)
                 return DatabaseTransientException(ex)
             return DatabaseTerminalException(ex)
         elif isinstance(ex, databricks_lib.OperationalError):
-            return DatabaseTerminalException(ex)
+            return DatabaseTransientException(ex)
         elif isinstance(ex, (databricks_lib.ProgrammingError, databricks_lib.IntegrityError)):
             return DatabaseTerminalException(ex)
         elif isinstance(ex, databricks_lib.DatabaseError):

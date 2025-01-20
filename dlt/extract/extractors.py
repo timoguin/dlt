@@ -4,19 +4,22 @@ from typing import Set, Dict, Any, Optional, List, Union
 from dlt.common.configuration import known_sections, resolve_configuration, with_config
 from dlt.common import logger
 from dlt.common.configuration.specs import BaseConfiguration, configspec
-from dlt.common.data_writers import DataWriterMetrics
 from dlt.common.destination.capabilities import DestinationCapabilitiesContext
 from dlt.common.exceptions import MissingDependencyException
+from dlt.common.metrics import DataWriterMetrics
 from dlt.common.runtime.collector import Collector, NULL_COLLECTOR
 from dlt.common.typing import TDataItems, TDataItem, TLoaderFileFormat
 from dlt.common.schema import Schema, utils
 from dlt.common.schema.typing import (
+    C_DLT_LOAD_ID,
     TSchemaContractDict,
     TSchemaEvolutionMode,
     TTableSchema,
     TTableSchemaColumns,
     TPartialTableSchema,
 )
+from dlt.common.normalizers.json import helpers as normalize_helpers
+
 from dlt.extract.hints import HintsMeta, TResourceHints
 from dlt.extract.resource import DltResource
 from dlt.extract.items import DataItemWithMeta, TableNameMeta
@@ -140,7 +143,9 @@ class Extractor:
             self._write_to_dynamic_table(resource, items, meta)
 
     def write_empty_items_file(self, table_name: str) -> None:
-        table_name = self.naming.normalize_table_identifier(table_name)
+        table_name = normalize_helpers.normalize_table_identifier(
+            self.schema, self.naming, table_name
+        )
         self.item_storage.write_empty_items_file(self.load_id, self.schema.name, table_name, None)
 
     def _get_static_table_name(self, resource: DltResource, meta: Any) -> Optional[str]:
@@ -150,10 +155,12 @@ class Extractor:
             table_name = meta.table_name
         else:
             table_name = resource.table_name  # type: ignore[assignment]
-        return self.naming.normalize_table_identifier(table_name)
+        return normalize_helpers.normalize_table_identifier(self.schema, self.naming, table_name)
 
     def _get_dynamic_table_name(self, resource: DltResource, item: TDataItem) -> str:
-        return self.naming.normalize_table_identifier(resource._table_name_hint_fun(item))
+        return normalize_helpers.normalize_table_identifier(
+            self.schema, self.naming, resource._table_name_hint_fun(item)
+        )
 
     def _write_item(
         self,
@@ -243,7 +250,7 @@ class Extractor:
         # this is a new table so allow evolve once
         if schema_contract["columns"] != "evolve" and self.schema.is_new_table(table_name):
             computed_table["x-normalizer"] = {"evolve-columns-once": True}
-        existing_table = self.schema._schema_tables.get(table_name, None)
+        existing_table = self.schema.tables.get(table_name, None)
         if existing_table:
             # TODO: revise this. computed table should overwrite certain hints (ie. primary and merge keys) completely
             diff_table = utils.diff_table(self.schema.name, existing_table, computed_table)
@@ -257,7 +264,10 @@ class Extractor:
 
         # merge with schema table
         if diff_table:
-            self.schema.update_table(diff_table)
+            # diff table identifiers already normalized
+            self.schema.update_table(
+                diff_table, normalize_identifiers=False, from_diff=bool(existing_table)
+            )
 
         # process filters
         if filters:
@@ -318,7 +328,7 @@ class ArrowExtractor(Extractor):
             )
             for tbl in (
                 (
-                    # 1. Convert pandas frame(s) to arrow Table
+                    # 1. Convert pandas frame(s) to arrow Table, remove indexes because we store
                     pandas_to_arrow(item)
                     if (pandas and isinstance(item, pandas.DataFrame))
                     else item
@@ -410,16 +420,10 @@ class ArrowExtractor(Extractor):
             arrow_table["columns"] = pyarrow.py_arrow_to_table_schema_columns(item.schema)
 
             # Add load_id column if needed
-            dlt_load_id_col = self.naming.normalize_table_identifier("_dlt_load_id")
-            if (
-                self._normalize_config.add_dlt_load_id
-                and dlt_load_id_col not in arrow_table["columns"]
-            ):
-                arrow_table["columns"][dlt_load_id_col] = {
-                    "name": dlt_load_id_col,
-                    "data_type": "text",
-                    "nullable": False,
-                }
+            dlt_load_id = self.naming.normalize_identifier(C_DLT_LOAD_ID)
+            if self._normalize_config.add_dlt_load_id and dlt_load_id not in arrow_table["columns"]:
+                # will be normalized line below
+                arrow_table["columns"][C_DLT_LOAD_ID] = utils.dlt_load_id_column()
 
             # normalize arrow table before merging
             arrow_table = utils.normalize_table_identifiers(arrow_table, self.schema.naming)

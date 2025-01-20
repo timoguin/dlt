@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUNTIME__SENTRY_DSN: https://6f6f7b6f8e0f458a89be4187603b55fe@o1061158.ingest.sentry.io/4504819859914752
+  # RUNTIME__SENTRY_DSN: https://6f6f7b6f8e0f458a89be4187603b55fe@o1061158.ingest.sentry.io/4504819859914752
   RUNTIME__LOG_LEVEL: ERROR
   DLT_SECRETS_TOML: ${{ secrets.DLT_SECRETS_TOML }}
 
@@ -52,6 +52,7 @@ jobs:
           virtualenvs-create: true
           virtualenvs-in-project: true
           installer-parallel: true
+          version: 1.8.5
 
       - name: Load cached venv
         id: cached-poetry-dependencies
@@ -61,21 +62,21 @@ jobs:
           key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}-gcp
 
       - name: Install dependencies
-        run: poetry install --no-interaction -E clickhouse --with providers -E parquet --with sentry-sdk --with pipeline
+        run: poetry install --no-interaction -E clickhouse --with providers -E parquet --with sentry-sdk --with pipeline && poetry run pip install ibis-framework[duckdb,postgres,bigquery,snowflake,mssql,clickhouse]
 
       - name: create secrets.toml
         run: pwd && echo "$DLT_SECRETS_TOML" > tests/.dlt/secrets.toml
 
       # OSS ClickHouse
       - run: |
-          docker-compose -f "tests/load/clickhouse/clickhouse-compose.yml" up -d
+          docker compose -f "tests/load/clickhouse/clickhouse-compose.yml" up -d
           echo "Waiting for ClickHouse to be healthy..."
-          timeout 30s bash -c 'until docker-compose -f "tests/load/clickhouse/clickhouse-compose.yml" ps | grep -q "healthy"; do sleep 1; done'
+          timeout 30s bash -c 'until docker compose -f "tests/load/clickhouse/clickhouse-compose.yml" ps | grep -q "healthy"; do sleep 1; done'
           echo "ClickHouse is up and running"
         name: Start ClickHouse OSS
 
 
-      - run: poetry run pytest tests/load -m "essential"
+      - run: poetry run pytest tests/load --ignore tests/load/sources -m "essential"
         name: Run essential tests Linux (ClickHouse OSS)
         if: ${{ ! (contains(github.event.pull_request.labels.*.name, 'ci full') || github.event_name == 'schedule')}}
         env:
@@ -87,7 +88,7 @@ jobs:
           DESTINATION__CLICKHOUSE__CREDENTIALS__HTTP_PORT: 8123
           DESTINATION__CLICKHOUSE__CREDENTIALS__SECURE: 0
 
-      - run: poetry run pytest tests/load
+      - run: poetry run pytest tests/load --ignore tests/load/sources
         name: Run all tests Linux (ClickHouse OSS)
         if: ${{ contains(github.event.pull_request.labels.*.name, 'ci full') || github.event_name == 'schedule'}}
         env:
@@ -101,16 +102,16 @@ jobs:
 
       - name: Stop ClickHouse OSS
         if: always()
-        run: docker-compose -f "tests/load/clickhouse/clickhouse-compose.yml" down -v
+        run: docker compose -f "tests/load/clickhouse/clickhouse-compose.yml" down -v
 
       # ClickHouse Cloud
       - run: |
-          poetry run pytest tests/load -m "essential"
+          poetry run pytest tests/load --ignore tests/load/sources -m "essential"
         name: Run essential tests Linux (ClickHouse Cloud)
         if: ${{ ! (contains(github.event.pull_request.labels.*.name, 'ci full') || github.event_name == 'schedule')}}
 
       - run: |
-          poetry run pytest tests/load
+          poetry run pytest tests/load --ignore tests/load/sources
         name: Run all tests Linux (ClickHouse Cloud)
         if: ${{ contains(github.event.pull_request.labels.*.name, 'ci full') || github.event_name == 'schedule'}}
 

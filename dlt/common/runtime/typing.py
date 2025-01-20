@@ -1,9 +1,8 @@
 from typing import (
     List,
     Literal,
-    TypedDict,
 )
-
+from dlt.common.typing import TypedDict
 
 TExecInfoNames = Literal[
     "kubernetes",
@@ -15,6 +14,7 @@ TExecInfoNames = Literal[
     "colab",
     "aws_lambda",
     "gcp_cloud_function",
+    "streamlit",
 ]
 
 

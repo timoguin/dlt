@@ -1,27 +1,35 @@
+import multiprocessing
+import os
 from typing import Iterator, Generator, Any, List
+from typing import Mapping
+from typing import Union, Dict
 
 import pytest
+from lancedb import DBConnection  # type: ignore
+from lancedb.embeddings import EmbeddingFunctionRegistry  # type: ignore
+from lancedb.table import Table  # type: ignore
 
 import dlt
 from dlt.common import json
-from dlt.common.typing import DictStrStr, DictStrAny
-from dlt.common.utils import uniq_id
+from dlt.common.typing import DictStrAny
+from dlt.common.typing import DictStrStr
+from dlt.common.utils import uniq_id, digest128
 from dlt.destinations.impl.lancedb.lancedb_adapter import (
     lancedb_adapter,
     VECTORIZE_HINT,
 )
 from dlt.destinations.impl.lancedb.lancedb_client import LanceDBClient
-from tests.load.lancedb.utils import assert_table
+from dlt.extract import DltResource
+from tests.load.lancedb.utils import assert_table, chunk_document, mock_embed
 from tests.load.utils import sequence_generator, drop_active_pipeline_data
 from tests.pipeline.utils import assert_load_info
 
-
-# Mark all tests as essential, do not remove.
+# Mark all tests as essential, don't remove.
 pytestmark = pytest.mark.essential
 
 
 @pytest.fixture(autouse=True)
-def drop_lancedb_data() -> Iterator[None]:
+def drop_lancedb_data() -> Iterator[Any]:
     yield
     drop_active_pipeline_data()
 
@@ -45,6 +53,22 @@ def test_adapter_and_hints() -> None:
         "data_type": "text",
         "x-lancedb-embed": True,
     }
+
+    lancedb_adapter(
+        some_data,
+        merge_key="content",
+    )
+
+    # via merge_key
+    assert some_data._hints["merge_key"] == "content"
+
+    assert some_data.columns["content"] == {  # type: ignore
+        "name": "content",
+        "data_type": "text",
+        "x-lancedb-embed": True,
+    }
+
+    assert some_data.compute_table_schema()["columns"]["content"]["merge_key"] is True
 
 
 def test_basic_state_and_schema() -> None:
@@ -72,7 +96,7 @@ def test_basic_state_and_schema() -> None:
     client: LanceDBClient
     with pipeline.destination_client() as client:  # type: ignore
         # Check if we can get a stored schema and state.
-        schema = client.get_stored_schema()
+        schema = client.get_stored_schema(client.schema.name)
         print("Print dataset name", client.dataset_name)
         assert schema
         state = client.get_stored_state("test_pipeline_append")
@@ -115,14 +139,13 @@ def test_pipeline_append() -> None:
 
 
 def test_explicit_append() -> None:
-    """Append should work even when the primary key is specified."""
     data = [
         {"doc_id": 1, "content": "1"},
         {"doc_id": 2, "content": "2"},
         {"doc_id": 3, "content": "3"},
     ]
 
-    @dlt.resource(primary_key="doc_id")
+    @dlt.resource()
     def some_data() -> Generator[List[DictStrAny], Any, None]:
         yield data
 
@@ -139,6 +162,7 @@ def test_explicit_append() -> None:
     info = pipeline.run(
         some_data(),
     )
+    assert_load_info(info)
 
     assert_table(pipeline, "some_data", items=data)
 
@@ -153,17 +177,14 @@ def test_explicit_append() -> None:
 
 
 def test_pipeline_replace() -> None:
-    generator_instance1 = sequence_generator()
-    generator_instance2 = sequence_generator()
+    os.environ["DATA_WRITER__BUFFER_MAX_ITEMS"] = "2"
+    os.environ["DATA_WRITER__FILE_MAX_ITEMS"] = "2"
+
+    generator_instance1, generator_instance2 = (sequence_generator(), sequence_generator())
 
     @dlt.resource
     def some_data() -> Generator[DictStrStr, Any, None]:
         yield from next(generator_instance1)
-
-    lancedb_adapter(
-        some_data,
-        embed=["content"],
-    )
 
     uid = uniq_id()
 
@@ -171,7 +192,7 @@ def test_pipeline_replace() -> None:
         pipeline_name="test_pipeline_replace",
         destination="lancedb",
         dataset_name="test_pipeline_replace_dataset"
-        + uid,  # lancedb doesn't mandate any name normalization
+        + uid,  # Lancedb doesn't mandate any name normalization.
     )
 
     info = pipeline.run(
@@ -260,23 +281,11 @@ def test_pipeline_merge() -> None:
         },
     ]
 
-    @dlt.resource(primary_key="doc_id")
+    @dlt.resource(primary_key=["doc_id"])
     def movies_data() -> Any:
         yield data
 
-    @dlt.resource(primary_key="doc_id", merge_key=["merge_id", "title"])
-    def movies_data_explicit_merge_keys() -> Any:
-        yield data
-
-    lancedb_adapter(
-        movies_data,
-        embed=["description"],
-    )
-
-    lancedb_adapter(
-        movies_data_explicit_merge_keys,
-        embed=["description"],
-    )
+    lancedb_adapter(movies_data, embed=["description"], no_remove_orphans=True)
 
     pipeline = dlt.pipeline(
         pipeline_name="movies",
@@ -285,7 +294,7 @@ def test_pipeline_merge() -> None:
     )
     info = pipeline.run(
         movies_data(),
-        write_disposition="merge",
+        write_disposition={"disposition": "merge", "strategy": "upsert"},
         dataset_name=f"MoviesDataset{uniq_id()}",
     )
     assert_load_info(info)
@@ -296,25 +305,10 @@ def test_pipeline_merge() -> None:
 
     info = pipeline.run(
         movies_data(),
-        write_disposition="merge",
+        write_disposition={"disposition": "merge", "strategy": "upsert"},
     )
     assert_load_info(info)
     assert_table(pipeline, "movies_data", items=data)
-
-    info = pipeline.run(
-        movies_data(),
-        write_disposition="merge",
-    )
-    assert_load_info(info)
-    assert_table(pipeline, "movies_data", items=data)
-
-    # Test with explicit merge keys.
-    info = pipeline.run(
-        movies_data_explicit_merge_keys(),
-        write_disposition="merge",
-    )
-    assert_load_info(info)
-    assert_table(pipeline, "movies_data_explicit_merge_keys", items=data)
 
 
 def test_pipeline_with_schema_evolution() -> None:
@@ -385,9 +379,9 @@ def test_merge_github_nested() -> None:
         data = json.load(f)
 
     info = pipe.run(
-        lancedb_adapter(data[:17], embed=["title", "body"]),
+        lancedb_adapter(data[:17], embed=["title", "body"], no_remove_orphans=True),
         table_name="issues",
-        write_disposition="merge",
+        write_disposition={"disposition": "merge", "strategy": "upsert"},
         primary_key="id",
     )
     assert_load_info(info)
@@ -423,13 +417,234 @@ def test_merge_github_nested() -> None:
 def test_empty_dataset_allowed() -> None:
     # dataset_name is optional so dataset name won't be autogenerated when not explicitly passed.
     pipe = dlt.pipeline(destination="lancedb", dev_mode=True)
-    client: LanceDBClient = pipe.destination_client()  # type: ignore[assignment]
 
     assert pipe.dataset_name is None
     info = pipe.run(lancedb_adapter(["context", "created", "not a stop word"], embed=["value"]))
     # Dataset in load info is empty.
     assert info.dataset_name is None
-    client = pipe.destination_client()  # type: ignore[assignment]
-    assert client.dataset_name is None
-    assert client.sentinel_table == "dltSentinelTable"
+    client = pipe.destination_client()
+    assert client.dataset_name is None  # type: ignore
+    assert client.sentinel_table == "dltSentinelTable"  # type: ignore
     assert_table(pipe, "content", expected_items_count=3)
+
+
+def test_lancedb_remove_nested_orphaned_records_with_chunks() -> None:
+    @dlt.resource(
+        write_disposition={"disposition": "merge", "strategy": "upsert"},
+        table_name="document",
+        primary_key=["doc_id"],
+        merge_key=["doc_id"],
+    )
+    def documents(docs: List[DictStrAny]) -> Generator[DictStrAny, None, None]:
+        for doc in docs:
+            doc_id = doc["doc_id"]
+            chunks = chunk_document(doc["text"])
+            embeddings = [
+                {
+                    "chunk_hash": digest128(chunk),
+                    "chunk_text": chunk,
+                    "embedding": mock_embed(),
+                }
+                for chunk in chunks
+            ]
+            yield {"doc_id": doc_id, "doc_text": doc["text"], "embeddings": embeddings}
+
+    @dlt.source(max_table_nesting=1)
+    def documents_source(
+        docs: List[DictStrAny],
+    ) -> Union[Generator[Dict[str, Any], None, None], DltResource]:
+        return documents(docs)
+
+    pipeline = dlt.pipeline(
+        pipeline_name="chunked_docs",
+        destination="lancedb",
+        dataset_name="chunked_documents",
+        dev_mode=True,
+    )
+
+    initial_docs = [
+        {
+            "text": (
+                "This is the first document. It contains some text that will be chunked and"
+                " embedded. (I don't want to be seen in updated run's embedding chunk texts btw)"
+            ),
+            "doc_id": 1,
+        },
+        {
+            "text": "Here's another document. It's a bit different from the first one.",
+            "doc_id": 2,
+        },
+    ]
+
+    info = pipeline.run(documents_source(initial_docs))
+    assert_load_info(info)
+
+    updated_docs = [
+        {
+            "text": "This is the first document, but it has been updated with new content.",
+            "doc_id": 1,
+        },
+        {
+            "text": "This is a completely new document that wasn't in the initial set.",
+            "doc_id": 3,
+        },
+    ]
+
+    info = pipeline.run(documents_source(updated_docs))
+    assert_load_info(info)
+
+    with pipeline.destination_client() as client:
+        # Orphaned chunks/documents must have been discarded.
+        # Shouldn't contain any text from `initial_docs' where doc_id=1.
+        expected_text = {
+            "Here's ano",
+            "ther docum",
+            "ent. It's ",
+            "a bit diff",
+            "erent from",
+            " the first",
+            " one.",
+            "This is th",
+            "e first do",
+            "cument, bu",
+            "t it has b",
+            "een update",
+            "d with new",
+            " content.",
+            "This is a ",
+            "completely",
+            " new docum",
+            "ent that w",
+            "asn't in t",
+            "he initial",
+            " set.",
+        }
+
+        embeddings_table_name = client.make_qualified_table_name("document__embeddings")  # type: ignore[attr-defined]
+
+        tbl: Table = client.db_client.open_table(embeddings_table_name)  # type: ignore[attr-defined]
+        df = tbl.to_pandas()
+        assert set(df["chunk_text"]) == expected_text
+
+
+search_data = [
+    {"text": "Frodo was a happy puppy"},
+    {"text": "There are several kittens playing"},
+]
+
+
+def test_fts_query() -> None:
+    @dlt.resource
+    def search_data_resource() -> Generator[Mapping[str, object], Any, None]:
+        yield from search_data
+
+    pipeline = dlt.pipeline(
+        pipeline_name="test_fts_query",
+        destination="lancedb",
+        dataset_name=f"test_pipeline_append{uniq_id()}",
+    )
+    info = pipeline.run(
+        search_data_resource(),
+    )
+    assert_load_info(info)
+
+    client: LanceDBClient
+    with pipeline.destination_client() as client:  # type: ignore[assignment]
+        db_client: DBConnection = client.db_client
+
+        table_name = client.make_qualified_table_name("search_data_resource")
+        tbl = db_client[table_name]
+        tbl.checkout_latest()
+
+        tbl.create_fts_index("text")
+        results = tbl.search("kittens", query_type="fts").select(["text"]).to_list()
+        assert results[0]["text"] == "There are several kittens playing"
+
+
+def test_semantic_query() -> None:
+    @dlt.resource
+    def search_data_resource() -> Generator[Mapping[str, object], Any, None]:
+        yield from search_data
+
+    lancedb_adapter(
+        search_data_resource,
+        embed=["text"],
+    )
+
+    pipeline = dlt.pipeline(
+        pipeline_name="test_fts_query",
+        destination="lancedb",
+        dataset_name=f"test_pipeline_append{uniq_id()}",
+    )
+    info = pipeline.run(
+        search_data_resource(),
+    )
+    assert_load_info(info)
+
+    client: LanceDBClient
+    with pipeline.destination_client() as client:  # type: ignore[assignment]
+        db_client: DBConnection = client.db_client
+
+        table_name = client.make_qualified_table_name("search_data_resource")
+        tbl = db_client[table_name]
+        tbl.checkout_latest()
+
+        results = (
+            tbl.search("puppy", query_type="vector", ordering_field_name="_distance")
+            .select(["text"])
+            .to_list()
+        )
+        assert results[0]["text"] == "Frodo was a happy puppy"
+
+
+def test_semantic_query_custom_embedding_functions_registered() -> None:
+    """Test the LanceDB registry registered custom embedding functions defined in models, if any.
+    See: https://github.com/dlt-hub/dlt/issues/1765"""
+
+    @dlt.resource
+    def search_data_resource() -> Generator[Mapping[str, object], Any, None]:
+        yield from search_data
+
+    lancedb_adapter(
+        search_data_resource,
+        embed=["text"],
+    )
+
+    pipeline = dlt.pipeline(
+        pipeline_name="test_fts_query",
+        destination="lancedb",
+        dataset_name=f"test_pipeline_append{uniq_id()}",
+    )
+    info = pipeline.run(
+        search_data_resource(),
+    )
+    assert_load_info(info)
+
+    client: LanceDBClient
+    with pipeline.destination_client() as client:  # type: ignore[assignment]
+        db_client_uri = client.db_client.uri
+        table_name = client.make_qualified_table_name("search_data_resource")
+
+    # A new python process doesn't seem to correctly deserialize the custom embedding
+    # functions into global __REGISTRY__.
+    # We make sure to reset it as well to make sure no globals are propagated to the spawned process.
+    EmbeddingFunctionRegistry().reset()
+    with multiprocessing.get_context("spawn").Pool(1) as pool:
+        results = pool.apply(run_lance_search_in_separate_process, (db_client_uri, table_name))
+
+    assert results[0]["text"] == "Frodo was a happy puppy"
+
+
+def run_lance_search_in_separate_process(db_client_uri: str, table_name: str) -> Any:
+    import lancedb
+
+    # Must read into __REGISTRY__ here.
+    db = lancedb.connect(db_client_uri)
+    tbl = db[table_name]
+    tbl.checkout_latest()
+
+    return (
+        tbl.search("puppy", query_type="vector", ordering_field_name="_distance")
+        .select(["text"])
+        .to_list()
+    )

@@ -1,6 +1,7 @@
 from typing import Dict, Any, Literal, Set, get_args
 
-from dlt.common.schema.typing import TColumnNames, TTableSchemaColumns
+from dlt.common.schema.typing import TTableSchemaColumns
+from dlt.common.typing import TColumnNames
 from dlt.extract import DltResource, resource as make_resource
 from dlt.destinations.utils import get_resource_for_adapter
 
@@ -87,6 +88,7 @@ def weaviate_adapter(
                     TOKENIZATION_HINT: method,  # type: ignore
                 }
 
+    # this makes sure that {} as column_hints never gets into apply_hints (that would reset existing columns)
     if not column_hints:
         raise ValueError("Either 'vectorize' or 'tokenization' must be specified.")
     else:

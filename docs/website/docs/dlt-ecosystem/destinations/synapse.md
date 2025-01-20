@@ -19,15 +19,15 @@ pip install "dlt[synapse]"
 * **Microsoft ODBC Driver for SQL Server**
 
     The _Microsoft ODBC Driver for SQL Server_ must be installed to use this destination.
-    This can't be included with `dlt`'s python dependencies, so you must install it separately on your system. You can find the official installation instructions [here](https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server?view=sql-server-ver16).
+    This cannot be included with `dlt`'s Python dependencies, so you must install it separately on your system. You can find the official installation instructions [here](https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server?view=sql-server-ver16).
 
     Supported driver versions:
     * `ODBC Driver 18 for SQL Server`
 
-    > 💡 Older driver versions don't work properly because they don't support the `LongAsMax` keyword that was [introduced](https://learn.microsoft.com/en-us/sql/connect/odbc/windows/features-of-the-microsoft-odbc-driver-for-sql-server-on-windows?view=sql-server-ver15#microsoft-odbc-driver-180-for-sql-server-on-windows) in `ODBC Driver 18 for SQL Server`. Synapse does not support the legacy ["long data types"](https://learn.microsoft.com/en-us/sql/t-sql/data-types/ntext-text-and-image-transact-sql), and requires "max data types" instead. `dlt` uses the `LongAsMax` keyword to automatically do the conversion.
+    > 💡 Older driver versions do not work properly because they do not support the `LongAsMax` keyword that was [introduced](https://learn.microsoft.com/en-us/sql/connect/odbc/windows/features-of-the-microsoft-odbc-driver-for-sql-server-on-windows?view=sql-server-ver15#microsoft-odbc-driver-180-for-sql-server-on-windows) in `ODBC Driver 18 for SQL Server`. Synapse does not support the legacy ["long data types"](https://learn.microsoft.com/en-us/sql/t-sql/data-types/ntext-text-and-image-transact-sql), and requires "max data types" instead. `dlt` uses the `LongAsMax` keyword to automatically do the conversion.
 * **Azure Synapse Workspace and dedicated SQL pool**
 
-    You need an Azure Synapse workspace with a dedicated SQL pool to load data into. If you don't have one yet, you can use this [quickstart](https://learn.microsoft.com/en-us/azure/synapse-analytics/quickstart-create-sql-pool-studio).
+    You need an Azure Synapse workspace with a dedicated SQL pool to load data into. If you do not have one yet, you can use this [quickstart](https://learn.microsoft.com/en-us/azure/synapse-analytics/quickstart-create-sql-pool-studio).
 
 ### Steps
 
@@ -81,7 +81,7 @@ host = "your_synapse_workspace_name.sql.azuresynapse.net"
 Equivalently, you can also pass a connection string as follows:
 
 ```toml
-# keep it at the top of your toml file! before any section starts
+# Keep it at the top of your TOML file, before any section starts
 destination.synapse.credentials = "synapse://loader:your_loader_password@your_synapse_workspace_name.azuresynapse.net/yourpool"
 ```
 
@@ -95,20 +95,22 @@ pipeline = dlt.pipeline(
     dataset_name='chess_data'
 )
 ```
-To use **Active Directory Principal**, you can use the `sqlalchemy.engine.URL.create` method to create the connection URL using your Active Directory Service Principal credentials. First create the connection string as:
+To use **Active Directory Principal**, you can use the `sqlalchemy.engine.URL.create` method to create the connection URL using your Active Directory Service Principal credentials. First, create the connection string as:
 ```py
 conn_str = (
     f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-    f"SERVER={server_name};"
-    f"DATABASE={database_name};"
-    f"UID={service_principal_id}@{tenant_id};"
-    f"PWD={service_principal_secret};"
+    f"SERVER={SERVER_NAME};"
+    f"DATABASE={DATABASE_NAME};"
+    f"UID={SERVICE_PRINCIPAL_ID}@{TENANT_ID};"
+    f"PWD={SERVICE_PRINCIPAL_SECRETS};"
     f"Authentication=ActiveDirectoryServicePrincipal"
 )
 ```
 
 Next, create the connection URL:
 ```py
+from sqlalchemy.engine import URL
+
 connection_url = URL.create(
     "mssql+pyodbc",
     query={"odbc_connect": conn_str}
@@ -138,11 +140,11 @@ Data is loaded via `INSERT` statements by default.
 
 ## Supported file formats
 * [insert-values](../file-formats/insert-format.md) is used by default
-* [parquet](../file-formats/parquet.md) is used when [staging](#staging-support) is enabled
+* [Parquet](../file-formats/parquet.md) is used when [staging](#staging-support) is enabled
 
 ## Data type limitations
-* **Synapse cannot load `TIME` columns from `parquet` files**. `dlt` will fail such jobs permanently. Use the `insert_values` file format instead, or convert `datetime.time` objects to `str` or `datetime.datetime`, to load `TIME` columns.
-* **Synapse does not have a complex/JSON/struct data type**. The `dlt` `complex` data type is mapped to the `nvarchar` type in Synapse.
+* **Synapse cannot load `TIME` columns from Parquet files**. `dlt` will fail such jobs permanently. Use the `insert_values` file format instead, or convert `datetime.time` objects to `str` or `datetime.datetime` to load `TIME` columns.
+* **Synapse does not have a nested/JSON/struct data type**. The `dlt` `json` data type is mapped to the `nvarchar` type in Synapse.
 
 ## Table index type
 The [table index type](https://learn.microsoft.com/en-us/azure/synapse-analytics/sql-data-warehouse/sql-data-warehouse-tables-index) of the created tables can be configured at the resource level with the `synapse_adapter`:
@@ -152,7 +154,7 @@ from dlt.destinations.adapters import synapse_adapter
 
 info = pipeline.run(
     synapse_adapter(
-        data=your_resource,
+        data=my_resource,
         table_index_type="clustered_columnstore_index",
     )
 )
@@ -173,10 +175,10 @@ Possible values:
 
 ## Supported column hints
 
-Synapse supports the following [column hints](https://dlthub.com/docs/general-usage/schema#tables-and-columns):
+Synapse supports the following [column hints](../../general-usage/schema#tables-and-columns):
 
-* `primary_key` - creates a `PRIMARY KEY NONCLUSTERED NOT ENFORCED` constraint on the column
-* `unique` - creates a `UNIQUE NOT ENFORCED` constraint on the column
+* `primary_key` - creates a `PRIMARY KEY NONCLUSTERED NOT ENFORCED` constraint on the column.
+* `unique` - creates a `UNIQUE NOT ENFORCED` constraint on the column.
 
 > ❗ These hints are **disabled by default**. This is because the `PRIMARY KEY` and `UNIQUE` [constraints](https://learn.microsoft.com/en-us/azure/synapse-analytics/sql-data-warehouse/sql-data-warehouse-table-constraints) are tricky in Synapse: they are **not enforced** and can lead to inaccurate results if the user does not ensure all column values are unique. For the column hints to take effect, the `create_indexes` configuration needs to be set to `True`, see [additional destination options](#additional-destination-options).
 
@@ -189,7 +191,7 @@ To run Synapse with staging on Azure Blob Storage:
 
 ```py
 # Create a dlt pipeline that will load
-# chess player data to the snowflake destination
+# chess player data to the Synapse destination
 # via staging on Azure Blob Storage
 pipeline = dlt.pipeline(
     pipeline_name='chess_pipeline',
@@ -215,7 +217,7 @@ connect_timeout = 15
 `port` and `connect_timeout` can also be included in the connection string:
 
 ```toml
-# keep it at the top of your toml file! before any section starts
+# Keep it at the top of your TOML file, before any section starts
 destination.synapse.credentials = "synapse://loader:your_loader_password@your_synapse_workspace_name.azuresynapse.net:1433/yourpool?connect_timeout=15"
 ```
 
@@ -223,7 +225,7 @@ Descriptions:
 - `default_table_index_type` sets the [table index type](#table-index-type) that is used if no table index type is specified on the resource.
 - `create_indexes` determines if `primary_key` and `unique` [column hints](#supported-column-hints) are applied.
 - `staging_use_msi` determines if the Managed Identity of the Synapse workspace is used to authorize access to the [staging](#staging-support) Storage Account. Ensure the Managed Identity has the [Storage Blob Data Reader](https://learn.microsoft.com/en-us/azure/role-based-access-control/built-in-roles#storage-blob-data-reader) role (or a higher-privileged role) assigned on the blob container if you set this option to `"true"`.
-- `port` used for the ODBC connection.
+- `port` is used for the ODBC connection.
 - `connect_timeout` sets the timeout for the `pyodbc` connection attempt, in seconds.
 
 ### dbt support

@@ -13,6 +13,8 @@ from dlt.common.utils import (
     flatten_list_of_str_or_dicts,
     digest128,
     graph_edges_to_nodes,
+    group_dict_of_lists,
+    is_typeerror_due_to_wrong_call,
     map_nested_in_place,
     reveal_pseudo_secret,
     obfuscate_pseudo_secret,
@@ -24,6 +26,7 @@ from dlt.common.utils import (
     get_exception_trace,
     get_exception_trace_chain,
     update_dict_nested,
+    removeprefix,
 )
 
 
@@ -367,3 +370,82 @@ def test_nested_dict_merge() -> None:
         mappings_update, {"_config": {"_dsn": dsn, "_dict": {"a": 3}}}
     )
     assert mappings_update == deep_clone_dict_1_mappings
+
+
+def test_group_dict_of_lists_one_element_each_list():
+    input_dict = {"Frege": ["obj1"], "Gödel": ["obj2"], "Wittgenstein": ["obj3"]}
+    result = group_dict_of_lists(input_dict)
+    assert len(result) == 1
+    assert result[0] == {"Frege": "obj1", "Gödel": "obj2", "Wittgenstein": "obj3"}
+
+
+def test_group_dict_of_lists_equal_length_lists():
+    input_dict = {
+        "Frege": ["obj1", "obj2"],
+        "Gödel": ["obj3", "obj4"],
+        "Wittgenstein": ["obj5", "obj6"],
+    }
+    result = group_dict_of_lists(input_dict)
+    assert len(result) == 2
+    assert result[0] == {"Frege": "obj1", "Gödel": "obj3", "Wittgenstein": "obj5"}
+    assert result[1] == {"Frege": "obj2", "Gödel": "obj4", "Wittgenstein": "obj6"}
+
+
+def test_group_dict_of_lists_various_length_lists():
+    input_dict = {
+        "Frege": ["obj1", "obj2", "obj3"],
+        "Gödel": ["obj4", "obj5"],
+        "Wittgenstein": ["obj6"],
+    }
+    result = group_dict_of_lists(input_dict)
+    assert len(result) == 3
+    assert result[0] == {"Frege": "obj1", "Gödel": "obj4", "Wittgenstein": "obj6"}
+    assert result[1] == {"Frege": "obj2", "Gödel": "obj5"}
+    assert result[2] == {"Frege": "obj3"}
+
+    # Check if the sizes of the decomposed dicts are decreasing
+    sizes = [len(d) for d in result]
+    assert sizes == sorted(sizes, reverse=True), "Sizes of decomposed dicts are not decreasing"
+
+
+def function_typeerror_exc(a, b):
+    raise TypeError("wrong type")
+
+
+def test_is_typeerror_due_to_wrong_call() -> None:
+    def _function_test(a, *, b=None):
+        return a, b
+
+    try:
+        _function_test()  # type: ignore[call-arg]
+    except Exception as exc:
+        assert is_typeerror_due_to_wrong_call(exc, _function_test) is True
+
+    try:
+        _function_test("a", "b")  # type: ignore[misc]
+    except Exception as exc:
+        assert is_typeerror_due_to_wrong_call(exc, _function_test) is True
+
+    try:
+        1 / 0
+    except Exception as exc:
+        assert is_typeerror_due_to_wrong_call(exc, _function_test) is False
+
+    try:
+        function_typeerror_exc()  # type: ignore[call-arg]
+    except Exception as exc:
+        assert is_typeerror_due_to_wrong_call(exc, function_typeerror_exc) is True
+
+    try:
+        function_typeerror_exc("a", "b")
+    except Exception as exc:
+        assert str(exc) == "wrong type"
+        assert is_typeerror_due_to_wrong_call(exc, function_typeerror_exc) is False
+
+
+def test_removeprefix() -> None:
+    assert removeprefix("a_data", "a_") == "data"
+    assert removeprefix("a_data", "a_data") == ""
+    assert removeprefix("a_data", "a_data_1") == "a_data"
+    assert removeprefix("", "a_data_1") == ""
+    assert removeprefix("a_data", "") == "a_data"

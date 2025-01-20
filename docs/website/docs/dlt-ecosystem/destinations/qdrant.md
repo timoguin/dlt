@@ -9,7 +9,7 @@ keywords: [qdrant, vector database, destination, dlt]
 [Qdrant](https://qdrant.tech/) is an open-source, high-performance vector search engine/database. It deploys as an API service, providing a search for the nearest high-dimensional vectors.
 This destination helps you load data into Qdrant from [dlt resources](../../general-usage/resource.md).
 
-## Setup Guide
+## Setup guide
 
 1. To use Qdrant as a destination, make sure `dlt` is installed with the `qdrant` extra:
 
@@ -87,7 +87,7 @@ To use vector search after the data has been loaded, you must specify which fiel
 The `qdrant_adapter` is a helper function that configures the resource for the Qdrant destination:
 
 ```py
-qdrant_adapter(data, embed)
+qdrant_adapter(data, embed="title")
 ```
 
 It accepts the following arguments:
@@ -106,10 +106,25 @@ qdrant_adapter(
 )
 ```
 
+When using the `qdrant_adapter`, it's important to apply it directly to resources, not to the whole source. Here's an example:
+
+```py
+products_tables = sql_database().with_resources("products", "customers")
+
+pipeline = dlt.pipeline(
+        pipeline_name="postgres_to_qdrant_pipeline",
+        destination="qdrant",
+    )
+
+# apply adapter to the needed resources
+qdrant_adapter(products_tables.products, embed="description")
+qdrant_adapter(products_tables.customers, embed="bio")
+
+info = pipeline.run(products_tables)
+```
+
 :::tip
-
 A more comprehensive pipeline would load data from some API or use one of dlt's [verified sources](../verified-sources/).
-
 :::
 
 ## Write disposition
@@ -148,7 +163,7 @@ info = pipeline.run(
 )
 ```
 
-Internally, dlt will use `primary_key` (`document_id` in the example above) to generate a unique identifier (UUID) for each point in Qdrant. If the object with the same UUID already exists in Qdrant, it will be updated with the new data. Otherwise, a new point will be created.
+Internally, dlt will use the `primary_key` (`document_id` in the example above) to generate a unique identifier (UUID) for each point in Qdrant. If the object with the same UUID already exists in Qdrant, it will be updated with the new data. Otherwise, a new point will be created.
 
 :::caution
 
@@ -193,7 +208,7 @@ pipeline = dlt.pipeline(
 
 - `model`: (str) The name of the FlagEmbedding model to use. See the list of supported models at [Supported Models](https://qdrant.github.io/fastembed/examples/Supported_Models/). The default value is "BAAI/bge-small-en".
 
-### [Qdrant Client Options](#qdrant-client-options)
+### Qdrant client options
 
 The `QdrantClientOptions` class provides options for configuring the Qdrant client.
 
@@ -203,7 +218,7 @@ The `QdrantClientOptions` class provides options for configuring the Qdrant clie
 
 - `prefer_grpc`: (bool) If `true`, the client will prefer to use the gRPC interface whenever possible in custom methods. The default value is `false`.
 
-- `https`: (bool) If `true`, the client will use the HTTPS (SSL) protocol. The default value is `true` if an API Key is provided, else `false`.
+- `https`: (bool) If `true`, the client will use the HTTPS (SSL) protocol. The default value is `true` if an API key is provided, otherwise `false`.
 
 - `prefix`: (str) If set, it adds the specified `prefix` to the REST URL path. For example, setting it to "service/v1" will result in the REST API URL as `http://localhost:6333/service/v1/{qdrant-endpoint}`. Not set by default.
 
@@ -215,7 +230,7 @@ The `QdrantClientOptions` class provides options for configuring the Qdrant clie
 
 ### Run Qdrant locally
 
-You can find the setup instructions to run Qdrant [here](https://qdrant.tech/documentation/quick-start/#download-and-run)
+You can find the setup instructions to run Qdrant [here](https://qdrant.tech/documentation/quick-start/#download-and-run).
 
 ### Syncing of `dlt` state
 

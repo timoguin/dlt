@@ -3,9 +3,16 @@ import os
 
 pytest.importorskip("databricks")
 
-
-from dlt.destinations.impl.databricks.configuration import DatabricksClientConfiguration
+from dlt.common.exceptions import TerminalValueError
+from dlt.common.configuration.exceptions import ConfigurationValueError
+from dlt.destinations.impl.databricks.databricks import DatabricksLoadJob
 from dlt.common.configuration import resolve_configuration
+
+from dlt.destinations import databricks
+from dlt.destinations.impl.databricks.configuration import (
+    DatabricksClientConfiguration,
+    DATABRICKS_APPLICATION_ID,
+)
 
 # mark all tests as essential, do not remove
 pytestmark = pytest.mark.essential
@@ -34,3 +41,58 @@ def test_databricks_credentials_to_connector_params():
     assert params["extra_a"] == "a"
     assert params["extra_b"] == "b"
     assert params["_socket_timeout"] == credentials.socket_timeout
+    assert params["_user_agent_entry"] == DATABRICKS_APPLICATION_ID
+
+
+def test_databricks_configuration() -> None:
+    bricks = databricks()
+    config = bricks.configuration(None, accept_partial=True)
+    assert config.is_staging_external_location is False
+    assert config.staging_credentials_name is None
+
+    os.environ["IS_STAGING_EXTERNAL_LOCATION"] = "true"
+    os.environ["STAGING_CREDENTIALS_NAME"] = "credential"
+    config = bricks.configuration(None, accept_partial=True)
+    assert config.is_staging_external_location is True
+    assert config.staging_credentials_name == "credential"
+
+    # explicit params
+    bricks = databricks(is_staging_external_location=None, staging_credentials_name="credential2")
+    config = bricks.configuration(None, accept_partial=True)
+    assert config.staging_credentials_name == "credential2"
+    assert config.is_staging_external_location is None
+
+
+def test_databricks_abfss_converter() -> None:
+    with pytest.raises(TerminalValueError):
+        DatabricksLoadJob.ensure_databricks_abfss_url("az://dlt-ci-test-bucket")
+
+    abfss_url = DatabricksLoadJob.ensure_databricks_abfss_url(
+        "az://dlt-ci-test-bucket", "my_account"
+    )
+    assert abfss_url == "abfss://dlt-ci-test-bucket@my_account.dfs.core.windows.net"
+
+    abfss_url = DatabricksLoadJob.ensure_databricks_abfss_url(
+        "az://dlt-ci-test-bucket/path/to/file.parquet", "my_account"
+    )
+    assert (
+        abfss_url
+        == "abfss://dlt-ci-test-bucket@my_account.dfs.core.windows.net/path/to/file.parquet"
+    )
+
+    abfss_url = DatabricksLoadJob.ensure_databricks_abfss_url(
+        "az://dlt-ci-test-bucket@my_account.dfs.core.windows.net/path/to/file.parquet"
+    )
+    assert (
+        abfss_url
+        == "abfss://dlt-ci-test-bucket@my_account.dfs.core.windows.net/path/to/file.parquet"
+    )
+
+
+def test_databricks_auth_invalid() -> None:
+    with pytest.raises(ConfigurationValueError, match="No valid authentication method detected.*"):
+        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_ID"] = ""
+        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_SECRET"] = ""
+        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"] = ""
+        bricks = databricks()
+        bricks.configuration(None, accept_partial=True)

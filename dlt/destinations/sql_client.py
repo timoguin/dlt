@@ -16,18 +16,28 @@ from typing import (
     Type,
     AnyStr,
     List,
-    TypedDict,
+    Generator,
+    cast,
 )
 
-from dlt.common.typing import TFun
+from dlt.common.typing import TFun, TypedDict
+from dlt.common.schema.typing import TTableSchemaColumns
 from dlt.common.destination import DestinationCapabilitiesContext
 from dlt.common.utils import concat_strings_with_limit
+from dlt.common.destination.reference import JobClientBase
 
 from dlt.destinations.exceptions import (
     DestinationConnectionError,
     LoadClientNotConnected,
 )
-from dlt.destinations.typing import DBApi, TNativeConn, DBApiCursor, DataFrame, DBTransaction
+from dlt.destinations.typing import (
+    DBApi,
+    TNativeConn,
+    DataFrame,
+    DBTransaction,
+    ArrowTable,
+)
+from dlt.common.destination.reference import DBApiCursor
 
 
 class TJobQueryTags(TypedDict):
@@ -59,8 +69,6 @@ class SqlClientBase(ABC, Generic[TNativeConn]):
         staging_dataset_name: str,
         capabilities: DestinationCapabilitiesContext,
     ) -> None:
-        if not dataset_name:
-            raise ValueError(dataset_name)
         self.dataset_name = dataset_name
         self.staging_dataset_name = staging_dataset_name
         self.database_name = database_name
@@ -132,6 +140,23 @@ SELECT 1
             f"DROP TABLE IF EXISTS {self.make_qualified_table_name(table)};" for table in tables
         ]
         self.execute_many(statements)
+
+    def _to_named_paramstyle(self, query: str, args: Sequence[Any]) -> Tuple[str, Dict[str, Any]]:
+        """Convert a query from "format" ( %s ) paramstyle to "named" ( :param_name ) paramstyle.
+        The %s are replaced with :arg0, :arg1, ... and the arguments are returned as a dictionary.
+
+        Args:
+            query: SQL query with %s placeholders
+            args: arguments to be passed to the query
+
+        Returns:
+            Tuple of the new query and a dictionary of named arguments
+        """
+        keys = [f"arg{i}" for i in range(len(args))]
+        # Replace position arguments (%s) with named arguments (:arg0, :arg1, ...)
+        query = query % tuple(f":{key}" for key in keys)
+        db_args = {key: db_arg for key, db_arg in zip(keys, args)}
+        return query, db_args
 
     @abstractmethod
     def execute_sql(
@@ -232,7 +257,13 @@ SELECT 1
             self.dataset_name = current_dataset_name
 
     def with_staging_dataset(self) -> ContextManager["SqlClientBase[TNativeConn]"]:
+        """Temporarily switch sql client to staging dataset name"""
         return self.with_alternative_dataset_name(self.staging_dataset_name)
+
+    @property
+    def is_staging_dataset_active(self) -> bool:
+        """Checks if staging dataset is currently active"""
+        return self.dataset_name == self.staging_dataset_name
 
     def set_query_tags(self, tags: TJobQueryTags) -> None:
         """Sets current schema (source), resource, load_id and table name when a job starts"""
@@ -274,6 +305,23 @@ SELECT 1
         else:
             return f"DELETE FROM {qualified_table_name} WHERE 1=1;"
 
+    def _limit_clause_sql(self, limit: int) -> Tuple[str, str]:
+        return "", f"LIMIT {limit}"
+
+
+class WithSqlClient(JobClientBase):
+    @property
+    @abstractmethod
+    def sql_client(self) -> SqlClientBase[TNativeConn]: ...
+
+    def __enter__(self) -> "WithSqlClient":
+        return self
+
+    def __exit__(
+        self, exc_type: Type[BaseException], exc_val: BaseException, exc_tb: TracebackType
+    ) -> None:
+        pass
+
 
 class DBApiCursorImpl(DBApiCursor):
     """A DBApi Cursor wrapper with dataframes reading functionality"""
@@ -287,11 +335,20 @@ class DBApiCursorImpl(DBApiCursor):
         self.fetchmany = curr.fetchmany  # type: ignore
         self.fetchone = curr.fetchone  # type: ignore
 
+        self._set_default_schema_columns()
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self.native_cursor, name)
 
     def _get_columns(self) -> List[str]:
-        return [c[0] for c in self.native_cursor.description]
+        if self.native_cursor.description:
+            return [c[0] for c in self.native_cursor.description]
+        return []
+
+    def _set_default_schema_columns(self) -> None:
+        self.columns_schema = cast(
+            TTableSchemaColumns, {c: {"name": c, "nullable": True} for c in self._get_columns()}
+        )
 
     def df(self, chunk_size: int = None, **kwargs: Any) -> Optional[DataFrame]:
         """Fetches results as data frame in full or in specified chunks.
@@ -299,18 +356,56 @@ class DBApiCursorImpl(DBApiCursor):
         May use native pandas/arrow reader if available. Depending on
         the native implementation chunk size may vary.
         """
-        from dlt.common.libs.pandas_sql import _wrap_result
+        try:
+            return next(self.iter_df(chunk_size=chunk_size))
+        except StopIteration:
+            return None
 
-        columns = self._get_columns()
-        if chunk_size is None:
-            return _wrap_result(self.native_cursor.fetchall(), columns, **kwargs)
-        else:
-            df = _wrap_result(self.native_cursor.fetchmany(chunk_size), columns, **kwargs)
-            # if no rows return None
-            if df.shape[0] == 0:
-                return None
-            else:
-                return df
+    def arrow(self, chunk_size: int = None, **kwargs: Any) -> Optional[ArrowTable]:
+        """Fetches results as data frame in full or in specified chunks.
+
+        May use native pandas/arrow reader if available. Depending on
+        the native implementation chunk size may vary.
+        """
+        try:
+            return next(self.iter_arrow(chunk_size=chunk_size))
+        except StopIteration:
+            return None
+
+    def iter_fetch(self, chunk_size: int) -> Generator[List[Tuple[Any, ...]], Any, Any]:
+        while True:
+            if not (result := self.fetchmany(chunk_size)):
+                return
+            yield result
+
+    def iter_df(self, chunk_size: int) -> Generator[DataFrame, None, None]:
+        """Default implementation converts arrow to df"""
+        from dlt.common.libs.pandas import pandas as pd
+
+        for table in self.iter_arrow(chunk_size=chunk_size):
+            # NOTE: we go via arrow table, types are created for arrow is columns are known
+            # https://github.com/apache/arrow/issues/38644 for reference on types_mapper
+            yield table.to_pandas()
+
+    def iter_arrow(self, chunk_size: int) -> Generator[ArrowTable, None, None]:
+        """Default implementation converts query result to arrow table"""
+        from dlt.common.libs.pyarrow import row_tuples_to_arrow
+        from dlt.common.configuration.container import Container
+
+        # get capabilities of possibly currently active pipeline
+        caps = (
+            Container().get(DestinationCapabilitiesContext)
+            or DestinationCapabilitiesContext.generic_capabilities()
+        )
+
+        # note that columns_schema is inferred from the cursor and is not normalized
+        if not chunk_size:
+            result = self.fetchall()
+            yield row_tuples_to_arrow(result, caps, self.columns_schema, tz="UTC")
+            return
+
+        for result in self.iter_fetch(chunk_size=chunk_size):
+            yield row_tuples_to_arrow(result, caps, self.columns_schema, tz="UTC")
 
 
 def raise_database_error(f: TFun) -> TFun:

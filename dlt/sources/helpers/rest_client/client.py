@@ -16,8 +16,6 @@ from requests.auth import AuthBase
 
 from dlt.common import jsonpath, logger
 
-from dlt.sources.helpers.requests.retry import Client
-
 from .typing import HTTPMethodBasic, HTTPMethod, Hooks
 from .paginators import BasePaginator
 from .detector import PaginatorFactory, find_response_page_data
@@ -60,6 +58,7 @@ class RESTClient:
         auth (Optional[AuthBase]): Authentication configuration for all requests.
         paginator (Optional[BasePaginator]): Default paginator for handling paginated responses.
         data_selector (Optional[jsonpath.TJsonPath]): JSONPath selector for extracting data from responses.
+            Only used in `paginate`.
         session (BaseSession): HTTP session for making requests.
         paginator_factory (Optional[PaginatorFactory]): Factory for creating paginator instances,
             used for detecting paginators.
@@ -80,10 +79,15 @@ class RESTClient:
         self.auth = auth
 
         if session:
-            # dlt.sources.helpers.requests.session.Session
-            # has raise_for_status=True by default
+            # If the `session` is provided (for example, an instance of
+            # dlt.sources.helpers.requests.session.Session), warn if
+            # it has raise_for_status=True by default
             self.session = _warn_if_raise_for_status_and_return(session)
         else:
+            # Otherwise, create a new Client with disabled raise_for_status
+            # to allow for custom error handling in the hooks
+            from dlt.sources.helpers.requests.retry import Client
+
             self.session = Client(raise_for_status=False).session
 
         self.paginator = paginator
@@ -93,18 +97,18 @@ class RESTClient:
 
     def _create_request(
         self,
-        path: str,
+        path_or_url: str,
         method: HTTPMethod,
         params: Optional[Dict[str, Any]] = None,
         json: Optional[Dict[str, Any]] = None,
         auth: Optional[AuthBase] = None,
         hooks: Optional[Hooks] = None,
     ) -> Request:
-        parsed_url = urlparse(path)
+        parsed_url = urlparse(path_or_url)
         if parsed_url.scheme in ("http", "https"):
-            url = path
+            url = path_or_url
         else:
-            url = join_url(self.base_url, path)
+            url = join_url(self.base_url, path_or_url)
 
         return Request(
             method=method,
@@ -137,7 +141,7 @@ class RESTClient:
 
     def request(self, path: str = "", method: HTTPMethod = "GET", **kwargs: Any) -> Response:
         prepared_request = self._create_request(
-            path=path,
+            path_or_url=path,
             method=method,
             params=kwargs.pop("params", None),
             json=kwargs.pop("json", None),
@@ -168,6 +172,8 @@ class RESTClient:
 
         Args:
             path (str): Endpoint path for the request, relative to `base_url`.
+                Can also be a fully qualified URL; if starting with http(s) it will
+                be used instead of the base_url + path.
             method (HTTPMethodBasic): HTTP method for the request, defaults to 'get'.
             params (Optional[Dict[str, Any]]): URL parameters for the request.
             json (Optional[Dict[str, Any]]): JSON payload for the request.
@@ -182,9 +188,9 @@ class RESTClient:
             **kwargs (Any): Optional arguments to that the Request library accepts, such as
                 `stream`, `verify`, `proxies`, `cert`, `timeout`, and `allow_redirects`.
 
-
         Yields:
-            PageData[Any]: A page of data from the paginated API response, along with request and response context.
+            PageData[Any]: A page of data from the paginated API response, along with request
+                and response context.
 
         Raises:
             HTTPError: If the response status code is not a success code. This is raised
@@ -200,14 +206,14 @@ class RESTClient:
         data_selector = data_selector or self.data_selector
         hooks = hooks or {}
 
-        def raise_for_status(response: Response, *args: Any, **kwargs: Any) -> None:
-            response.raise_for_status()
-
+        # Add the raise_for_status hook to ensure an exception is raised on
+        # HTTP error status codes. This is a fallback to handle errors
+        # unless explicitly overridden in the provided hooks.
         if "response" not in hooks:
             hooks["response"] = [raise_for_status]
 
         request = self._create_request(
-            path=path, method=method, params=params, json=json, auth=auth, hooks=hooks
+            path_or_url=path, method=method, params=params, json=json, auth=auth, hooks=hooks
         )
 
         if paginator:
@@ -225,7 +231,7 @@ class RESTClient:
 
             if paginator is None:
                 paginator = self.detect_paginator(response, data)
-            paginator.update_state(response)
+            paginator.update_state(response, data)
             paginator.update_request(request)
 
             # yield data with context
@@ -303,6 +309,10 @@ class RESTClient:
                 " instance of the paginator as some settings may not be guessed correctly."
             )
         return paginator
+
+
+def raise_for_status(response: Response, *args: Any, **kwargs: Any) -> None:
+    response.raise_for_status()
 
 
 def _warn_if_raise_for_status_and_return(session: BaseSession) -> BaseSession:

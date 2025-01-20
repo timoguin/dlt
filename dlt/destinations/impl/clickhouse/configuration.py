@@ -1,8 +1,10 @@
 import dataclasses
 from typing import ClassVar, Dict, List, Any, Final, cast, Optional
+from typing_extensions import Annotated
 
 from dlt.common.configuration import configspec
 from dlt.common.configuration.specs import ConnectionStringCredentials
+from dlt.common.configuration.specs.base_configuration import NotResolved
 from dlt.common.destination.reference import (
     DestinationClientDwhWithStagingConfiguration,
 )
@@ -31,10 +33,6 @@ class ClickHouseCredentials(ConnectionStringCredentials):
     """Timeout for establishing connection. Defaults to 10 seconds."""
     send_receive_timeout: int = 300
     """Timeout for sending and receiving data. Defaults to 300 seconds."""
-    gcp_access_key_id: Optional[str] = None
-    """When loading from a gcp bucket, you need to provide gcp interoperable keys"""
-    gcp_secret_access_key: Optional[str] = None
-    """When loading from a gcp bucket, you need to provide gcp interoperable keys"""
 
     __config_gen_annotations__: ClassVar[List[str]] = [
         "host",
@@ -73,6 +71,10 @@ class ClickHouseClientConfiguration(DestinationClientDwhWithStagingConfiguration
     destination_type: Final[str] = dataclasses.field(  # type: ignore[misc]
         default="clickhouse", init=False, repr=False, compare=False
     )
+    # allow empty dataset names
+    dataset_name: Annotated[Optional[str], NotResolved()] = dataclasses.field(
+        default=None, init=False, repr=False, compare=False
+    )
     credentials: ClickHouseCredentials = None
 
     dataset_table_separator: str = "___"
@@ -81,6 +83,8 @@ class ClickHouseClientConfiguration(DestinationClientDwhWithStagingConfiguration
     """The default table engine to use. Defaults to 'merge_tree'. Other implemented options are 'shared_merge_tree' and 'replicated_merge_tree'."""
     dataset_sentinel_table_name: str = "dlt_sentinel_table"
     """Special table to mark dataset as existing"""
+    staging_use_https: bool = True
+    """Connect to the staging buckets via https"""
 
     __config_gen_annotations__: ClassVar[List[str]] = [
         "dataset_table_separator",

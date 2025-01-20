@@ -44,7 +44,7 @@ has-poetry:
 	poetry --version
 
 dev: has-poetry
-	poetry install --all-extras --with airflow,docs,providers,pipeline,sentry-sdk,dbt
+	poetry install --all-extras --with docs,providers,pipeline,sources,sentry-sdk
 
 lint:
 	./tools/check-package.sh
@@ -52,7 +52,7 @@ lint:
 	poetry run mypy --config-file mypy.ini dlt tests
 	poetry run flake8 --max-line-length=200 dlt
 	poetry run flake8 --max-line-length=200 tests --exclude tests/reflection/module_cases
-	poetry run black dlt docs tests --diff --extend-exclude=".*syntax_error.py"
+	poetry run black dlt docs tests --check --diff --color --extend-exclude=".*syntax_error.py"
 	# poetry run isort ./ --diff
 	# $(MAKE) lint-security
 
@@ -60,10 +60,12 @@ format:
 	poetry run black dlt docs tests --exclude=".*syntax_error.py|\.venv.*|_storage/.*"
 	# poetry run isort ./
 
-lint-and-test-snippets:
+lint-snippets:
 	cd docs/tools && poetry run python check_embedded_snippets.py full
-	poetry run mypy --config-file mypy.ini docs/website docs/examples docs/tools --exclude docs/tools/lint_setup --exclude docs/website/docs_processed
-	poetry run flake8 --max-line-length=200 docs/website docs/examples docs/tools
+
+lint-and-test-snippets: lint-snippets
+	poetry run mypy --config-file mypy.ini docs/website docs/tools --exclude docs/tools/lint_setup --exclude docs/website/docs_processed
+	poetry run flake8 --max-line-length=200 docs/website docs/tools --exclude docs/website/.dlt-repo
 	cd docs/website/docs && poetry run pytest --ignore=node_modules
 
 lint-and-test-examples:
@@ -72,7 +74,6 @@ lint-and-test-examples:
 	poetry run mypy --config-file mypy.ini docs/examples
 	cd docs/examples && poetry run pytest
 
-
 test-examples:
 	cd docs/examples && poetry run pytest
 
@@ -80,7 +81,7 @@ lint-security:
 	poetry run bandit -r dlt/ -n 3 -l
 
 test:
-	(set -a && . tests/.env && poetry run pytest tests)
+	poetry run pytest tests
 
 test-load-local:
 	DESTINATION__POSTGRES__CREDENTIALS=postgresql://loader:loader@localhost:5432/dlt_data DESTINATION__DUCKDB__CREDENTIALS=duckdb:///_storage/test_quack.duckdb  poetry run pytest tests -k '(postgres or duckdb)'
@@ -101,10 +102,22 @@ publish-library: build-library
 	poetry publish
 
 test-build-images: build-library
-	# TODO: enable when we can remove special duckdb setting for python 3.12
+	# NOTE: poetry export does not work with our many different deps, we install a subset and freeze
 	# poetry export -f requirements.txt --output _gen_requirements.txt --without-hashes --extras gcp --extras redshift
-	# grep `cat compiled_packages.txt` _gen_requirements.txt > compiled_requirements.txt
+	poetry install --no-interaction -E gcp -E redshift -E duckdb
+	poetry run pip freeze > _gen_requirements.txt
+	# filter out libs that need native compilation
+	grep `cat compiled_packages.txt` _gen_requirements.txt > compiled_requirements.txt
 	docker build -f deploy/dlt/Dockerfile.airflow --build-arg=COMMIT_SHA="$(shell git log -1 --pretty=%h)" --build-arg=IMAGE_VERSION="$(shell poetry version -s)" .
-	# docker build -f deploy/dlt/Dockerfile --build-arg=COMMIT_SHA="$(shell git log -1 --pretty=%h)" --build-arg=IMAGE_VERSION="$(shell poetry version -s)" .
+	docker build -f deploy/dlt/Dockerfile --build-arg=COMMIT_SHA="$(shell git log -1 --pretty=%h)" --build-arg=IMAGE_VERSION="$(shell poetry version -s)" .
 
+preprocess-docs:
+	# run docs preprocessing to run a few checks and ensure examples can be parsed
+	cd docs/website && npm i && npm run preprocess-docs
 
+start-test-containers:
+	docker compose -f "tests/load/dremio/docker-compose.yml" up -d
+	docker compose -f "tests/load/postgres/docker-compose.yml" up -d
+	docker compose -f "tests/load/weaviate/docker-compose.yml" up -d
+	docker compose -f "tests/load/filesystem_sftp/docker-compose.yml" up -d
+	docker compose -f "tests/load/sqlalchemy/docker-compose.yml" up -d

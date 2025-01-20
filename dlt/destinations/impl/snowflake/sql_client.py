@@ -1,5 +1,5 @@
 from contextlib import contextmanager, suppress
-from typing import Any, AnyStr, ClassVar, Dict, Iterator, Optional, Sequence, List
+from typing import Any, AnyStr, ClassVar, Iterator, Optional, Sequence
 
 import snowflake.connector as snowflake_lib
 
@@ -16,8 +16,9 @@ from dlt.destinations.sql_client import (
     raise_database_error,
     raise_open_connection_error,
 )
-from dlt.destinations.typing import DBApi, DBApiCursor, DBTransaction, DataFrame
+from dlt.destinations.typing import DBApi, DBTransaction, DataFrame
 from dlt.destinations.impl.snowflake.configuration import SnowflakeCredentials
+from dlt.common.destination.reference import DBApiCursor
 
 
 class SnowflakeCursorImpl(DBApiCursorImpl):

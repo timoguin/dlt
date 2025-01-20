@@ -6,7 +6,6 @@ from typing import (
     Generic,
     Optional,
     Set,
-    TypedDict,
     List,
     Type,
     Union,
@@ -15,6 +14,7 @@ from typing import (
 )
 from typing_extensions import Annotated, get_args, get_origin
 
+from dlt.common.typing import TypedDict
 from dlt.common.data_types import py_type_to_sc_type
 from dlt.common.exceptions import MissingDependencyException
 from dlt.common.schema import DataValidationError
@@ -32,6 +32,7 @@ from dlt.common.typing import (
     is_subclass,
     is_union_type,
 )
+from dlt.common.warnings import Dlt100DeprecationWarning
 
 try:
     from pydantic import BaseModel, ValidationError, Json, create_model
@@ -69,11 +70,12 @@ class DltConfig(TypedDict, total=False):
     >>> class ItemModel(BaseModel):
     >>>     b: bool
     >>>     nested: Dict[str, Any]
-    >>>     dlt_config: ClassVar[DltConfig] = {"skip_complex_types": True}
+    >>>     dlt_config: ClassVar[DltConfig] = {"skip_nested_types": True}
     """
 
-    skip_complex_types: bool
+    skip_nested_types: bool
     """If True, columns of complex types (`dict`, `list`, `BaseModel`) will be excluded from dlt schema generated from the model"""
+    skip_complex_types: bool  # deprecated
 
 
 def pydantic_to_table_schema_columns(
@@ -90,9 +92,17 @@ def pydantic_to_table_schema_columns(
     Returns:
         TTableSchemaColumns: table schema columns dict
     """
-    skip_complex_types = False
+    skip_nested_types = False
     if hasattr(model, "dlt_config"):
-        skip_complex_types = model.dlt_config.get("skip_complex_types", False)
+        if "skip_complex_types" in model.dlt_config:
+            warnings.warn(
+                "`skip_complex_types` is deprecated, use `skip_nested_types` instead.",
+                Dlt100DeprecationWarning,
+                stacklevel=2,
+            )
+            skip_nested_types = model.dlt_config["skip_complex_types"]
+        else:
+            skip_nested_types = model.dlt_config.get("skip_nested_types", False)
 
     result: TTableSchemaColumns = {}
 
@@ -130,16 +140,16 @@ def pydantic_to_table_schema_columns(
             data_type = py_type_to_sc_type(inner_type)
         except TypeError:
             if is_subclass(inner_type, BaseModel):
-                data_type = "complex"
+                data_type = "json"
                 is_inner_type_pydantic_model = True
             else:
                 # try to coerce unknown type to text
                 data_type = "text"
 
-        if is_inner_type_pydantic_model and not skip_complex_types:
+        if is_inner_type_pydantic_model and not skip_nested_types:
             result[name] = {
                 "name": name,
-                "data_type": "complex",
+                "data_type": "json",
                 "nullable": nullable,
             }
         elif is_inner_type_pydantic_model:
@@ -154,7 +164,7 @@ def pydantic_to_table_schema_columns(
                     **hints,
                     "name": snake_case_naming_convention.make_path(name, hints["name"]),
                 }
-        elif data_type == "complex" and skip_complex_types:
+        elif data_type == "json" and skip_nested_types:
             continue
         else:
             result[name] = {
@@ -238,20 +248,12 @@ def apply_schema_contract_to_model(
             return Annotated[_process_annotation(a_t), tuple(a_m)]  # type: ignore[return-value]
         elif is_list_generic_type(t_):
             l_t: Type[Any] = get_args(t_)[0]
-            try:
-                return get_origin(t_)[_process_annotation(l_t)]  # type: ignore[no-any-return]
-            except TypeError:
-                # this is Python3.8 fallback. it does not support indexers on types
-                return List[_process_annotation(l_t)]  # type: ignore
+            return get_origin(t_)[_process_annotation(l_t)]  # type: ignore[no-any-return]
         elif is_dict_generic_type(t_):
             k_t: Type[Any]
             v_t: Type[Any]
             k_t, v_t = get_args(t_)
-            try:
-                return get_origin(t_)[k_t, _process_annotation(v_t)]  # type: ignore[no-any-return]
-            except TypeError:
-                # this is Python3.8 fallback. it does not support indexers on types
-                return Dict[k_t, _process_annotation(v_t)]  # type: ignore
+            return get_origin(t_)[k_t, _process_annotation(v_t)]  # type: ignore[no-any-return]
         elif is_union_type(t_):
             u_t_s = tuple(_process_annotation(u_t) for u_t in extract_union_types(t_))
             return Union[u_t_s]  # type: ignore[return-value]

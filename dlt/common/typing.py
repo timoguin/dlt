@@ -29,6 +29,7 @@ from typing import (
     Iterator,
     Generator,
     NamedTuple,
+    Sequence,
 )
 
 from typing_extensions import (
@@ -42,6 +43,10 @@ from typing_extensions import (
     get_original_bases,
 )
 
+from typing_extensions import is_typeddict as _is_typeddict
+
+from typing_extensions import TypedDict  # noqa: I251
+
 try:
     from types import UnionType  # type: ignore[attr-defined]
 except ImportError:
@@ -52,15 +57,11 @@ except ImportError:
     # in versions of Python>=3.10.
     UnionType = Never
 
-if sys.version_info[:3] >= (3, 9, 0):
-    from typing import _SpecialGenericAlias, _GenericAlias  # type: ignore[attr-defined]
-    from types import GenericAlias  # type: ignore[attr-defined]
+from typing import _SpecialGenericAlias, _GenericAlias  # type: ignore[attr-defined]
+from types import GenericAlias
 
-    typingGenericAlias: Tuple[Any, ...] = (_GenericAlias, _SpecialGenericAlias, GenericAlias)
-else:
-    from typing import _GenericAlias  # type: ignore[attr-defined]
+typingGenericAlias: Tuple[Any, ...] = (_GenericAlias, _SpecialGenericAlias, GenericAlias)
 
-    typingGenericAlias = (_GenericAlias,)
 
 from dlt.common.pendulum import timedelta, pendulum
 
@@ -77,7 +78,10 @@ else:
     REPattern = _REPattern
     PathLike = os.PathLike
 
+
 AnyType: TypeAlias = Any
+CallableAny = NewType("CallableAny", Any)  # type: ignore[valid-newtype]
+"""A special callable Any that returns argument but is recognized as Any type by dlt hint checkers"""
 NoneType = type(None)
 DictStrAny: TypeAlias = Dict[str, Any]
 DictStrStr: TypeAlias = Dict[str, str]
@@ -93,8 +97,22 @@ TAnyFunOrGenerator = TypeVar(
 TAnyClass = TypeVar("TAnyClass", bound=object)
 TimedeltaSeconds = Union[int, float, timedelta]
 # represent secret value ie. coming from Kubernetes/Docker secrets or other providers
-TSecretValue = NewType("TSecretValue", Any)  # type: ignore
-TSecretStrValue = NewType("TSecretValue", str)  # type: ignore
+
+
+class SecretSentinel:
+    """Marks a secret type when part of type annotations"""
+
+
+if TYPE_CHECKING:
+    TSecretValue = Annotated[Any, SecretSentinel]
+else:
+    # use callable Any type for backward compatibility at runtime
+    TSecretValue = Annotated[CallableAny, SecretSentinel]
+
+TSecretStrValue = Annotated[str, SecretSentinel]
+
+TColumnNames = Union[str, Sequence[str]]
+"""A string representing a column name or a list of"""
 TDataItem: TypeAlias = Any
 """A single data item as extracted from data source"""
 TDataItems: TypeAlias = Union[TDataItem, List[TDataItem]]
@@ -106,8 +124,12 @@ TVariantRV = Tuple[str, Any]
 VARIANT_FIELD_FORMAT = "v_%s"
 TFileOrPath = Union[str, PathLike, IO[Any]]
 TSortOrder = Literal["asc", "desc"]
-TLoaderFileFormat = Literal["jsonl", "typed-jsonl", "insert_values", "parquet", "csv"]
+TLoaderFileFormat = Literal["jsonl", "typed-jsonl", "insert_values", "parquet", "csv", "reference"]
 """known loader file formats"""
+
+TDynHintType = TypeVar("TDynHintType")
+TFunHintTemplate = Callable[[TDataItem], TDynHintType]
+TTableHintTemplate = Union[TDynHintType, TFunHintTemplate[TDynHintType]]
 
 
 class ConfigValueSentinel(NamedTuple):
@@ -182,8 +204,9 @@ def is_callable_type(hint: Type[Any]) -> bool:
     return False
 
 
-def extract_type_if_modifier(t: Type[Any]) -> Optional[Type[Any]]:
-    if get_origin(t) in (Final, ClassVar, Annotated):
+def extract_type_if_modifier(t: Type[Any], preserve_annotated: bool = False) -> Optional[Type[Any]]:
+    modifiers = (Final, ClassVar) if preserve_annotated else (Final, ClassVar, Annotated)
+    if get_origin(t) in modifiers:
         t = get_args(t)[0]
         if m_t := extract_type_if_modifier(t):
             return m_t
@@ -215,6 +238,11 @@ def is_union_type(hint: Type[Any]) -> bool:
         return is_union_type(inner_t)
 
     return False
+
+
+def is_any_type(t: Type[Any]) -> bool:
+    """Checks if `t` is one of recognized Any types"""
+    return t in (Any, CallableAny)
 
 
 def is_optional_type(t: Type[Any]) -> bool:
@@ -293,7 +321,7 @@ def is_newtype_type(t: Type[Any]) -> bool:
 
 
 def is_typeddict(t: Type[Any]) -> bool:
-    if isinstance(t, _TypedDict):
+    if _is_typeddict(t):
         return True
     if inner_t := extract_type_if_modifier(t):
         return is_typeddict(inner_t)
@@ -302,7 +330,7 @@ def is_typeddict(t: Type[Any]) -> bool:
 
 def is_annotated(ann_type: Any) -> bool:
     try:
-        return issubclass(get_origin(ann_type), Annotated)  # type: ignore[arg-type]
+        return get_origin(ann_type) is Annotated
     except TypeError:
         return False
 
@@ -322,7 +350,10 @@ def is_dict_generic_type(t: Type[Any]) -> bool:
 
 
 def extract_inner_type(
-    hint: Type[Any], preserve_new_types: bool = False, preserve_literal: bool = False
+    hint: Type[Any],
+    preserve_new_types: bool = False,
+    preserve_literal: bool = False,
+    preserve_annotated: bool = False,
 ) -> Type[Any]:
     """Gets the inner type from Literal, Optional, Final and NewType
 
@@ -333,17 +364,23 @@ def extract_inner_type(
     Returns:
         Type[Any]: Inner type if hint was Literal, Optional or NewType, otherwise hint
     """
-    if maybe_modified := extract_type_if_modifier(hint):
-        return extract_inner_type(maybe_modified, preserve_new_types, preserve_literal)
+    if maybe_modified := extract_type_if_modifier(hint, preserve_annotated):
+        return extract_inner_type(
+            maybe_modified, preserve_new_types, preserve_literal, preserve_annotated
+        )
     # make sure we deal with optional directly
     if is_union_type(hint) and is_optional_type(hint):
-        return extract_inner_type(get_args(hint)[0], preserve_new_types, preserve_literal)
+        return extract_inner_type(
+            get_args(hint)[0], preserve_new_types, preserve_literal, preserve_annotated
+        )
     if is_literal_type(hint) and not preserve_literal:
         # assume that all literals are of the same type
         return type(get_args(hint)[0])
-    if is_newtype_type(hint) and not preserve_new_types:
+    if hasattr(hint, "__supertype__") and not preserve_new_types:
         # descend into supertypes of NewType
-        return extract_inner_type(hint.__supertype__, preserve_new_types, preserve_literal)
+        return extract_inner_type(
+            hint.__supertype__, preserve_new_types, preserve_literal, preserve_annotated
+        )
     return hint
 
 
@@ -399,15 +436,14 @@ def get_generic_type_argument_from_instance(
     """
     orig_param_type = Any
     if cls_ := getattr(instance, "__orig_class__", None):
-        # instance of generic class
-        pass
+        cls_ = extract_inner_type(cls_)
     elif bases_ := get_original_bases(instance.__class__):
         # instance of class deriving from generic
         cls_ = bases_[0]
     if cls_:
         orig_param_type = get_args(cls_)[0]
-    if orig_param_type is Any and sample_value is not None:
-        orig_param_type = type(sample_value)
+    if orig_param_type in (Any, CallableAny) and sample_value is not None:
+        orig_param_type = type(sample_value)  # type: ignore[assignment]
     return orig_param_type  # type: ignore
 
 
@@ -425,3 +461,38 @@ def copy_sig(
         return func
 
     return decorator
+
+
+def copy_sig_any(
+    wrapper: Callable[Concatenate[TDataItem, TInputArgs], Any],
+) -> Callable[
+    [Callable[..., TReturnVal]], Callable[Concatenate[TDataItem, TInputArgs], TReturnVal]
+]:
+    """Copies docstring and signature from wrapper to func but keeps the func return value type
+
+    It converts the type of first argument of the wrapper to Any which allows to type transformers in DltSources.
+    See filesystem source readers as example
+    """
+
+    def decorator(
+        func: Callable[..., TReturnVal]
+    ) -> Callable[Concatenate[Any, TInputArgs], TReturnVal]:
+        func.__doc__ = wrapper.__doc__
+        return func
+
+    return decorator
+
+
+def add_value_to_literal(literal: Any, value: Any) -> None:
+    """Extends a Literal at runtime with a new value.
+
+    Args:
+        literal (Type[Any]): Literal to extend
+        value (Any): Value to add
+
+    """
+    type_args = get_args(literal)
+
+    if value not in type_args:
+        type_args += (value,)
+        literal.__args__ = type_args

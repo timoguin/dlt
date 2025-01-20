@@ -14,7 +14,7 @@ keywords: [ clickhouse, destination, data warehouse ]
 pip install "dlt[clickhouse]"
 ```
 
-## Setup Guide
+## Setup guide
 
 ### 1. Initialize the dlt project
 
@@ -24,10 +24,9 @@ Let's start by initializing a new `dlt` project as follows:
 dlt init chess clickhouse
 ```
 
-> 💡 This command will initialize your pipeline with chess as the source and ClickHouse as the destination.
+`dlt init` command will initialize your pipeline with chess as the source and ClickHouse as the destination.
 
-The above command generates several files and directories, including `.dlt/secrets.toml` and a requirements file for ClickHouse. You can install the necessary dependencies specified in the
-requirements file by executing it as follows:
+The above command generates several files and directories, including `.dlt/secrets.toml` and a requirements file for ClickHouse. You can install the necessary dependencies specified in the requirements file by executing it as follows:
 
 ```sh
 pip install -r requirements.txt
@@ -43,7 +42,7 @@ To load data into ClickHouse, you need to create a ClickHouse database. While we
 
 2. To create a new database, connect to your ClickHouse server using the `clickhouse-client` command line tool or a SQL client of your choice.
 
-3. Run the following SQL commands to create a new database, user and grant the necessary permissions:
+3. Run the following SQL commands to create a new database, user, and grant the necessary permissions:
 
    ```sql
    CREATE DATABASE IF NOT EXISTS dlt;
@@ -61,7 +60,7 @@ To load data into ClickHouse, you need to create a ClickHouse database. While we
    [destination.clickhouse.credentials]
    database = "dlt"                         # The database name you created.
    username = "dlt"                         # ClickHouse username, default is usually "default".
-   password = "Dlt*12345789234567"          # ClickHouse password if any.
+   password = "Dlt*12345789234567"          # ClickHouse password, if any.
    host = "localhost"                       # ClickHouse server host.
    port = 9000                              # ClickHouse native TCP protocol port, default is 9000.
    http_port = 8443                         # ClickHouse HTTP port, default is 9000.
@@ -73,7 +72,7 @@ To load data into ClickHouse, you need to create a ClickHouse database. While we
     The default non-secure HTTP port for ClickHouse is `8123`.
     This is different from the default port `9000`, which is used for the native TCP protocol.
 
-    You must set `http_port` if you are not using external staging (i.e. you don't set the `staging` parameter in your pipeline). This is because dlt's built-in ClickHouse local storage staging uses the [clickhouse-connect](https://github.com/ClickHouse/clickhouse-connect) library, which communicates with ClickHouse over HTTP.
+    You must set `http_port` if you are not using external staging (i.e., you don't set the `staging` parameter in your pipeline). This is because dlt's built-in ClickHouse local storage staging uses the [clickhouse-connect](https://github.com/ClickHouse/clickhouse-connect) library, which communicates with ClickHouse over HTTP.
 
     Make sure your ClickHouse server is configured to accept HTTP connections on the port specified by `http_port`. For example:
 
@@ -90,7 +89,7 @@ To load data into ClickHouse, you need to create a ClickHouse database. While we
 2. You can pass a database connection string similar to the one used by the `clickhouse-driver` library. The credentials above will look like this:
 
    ```toml
-   # keep it at the top of your toml file before any section starts.
+   # Keep it at the top of your TOML file, before any section starts
    destination.clickhouse.credentials="clickhouse://dlt:Dlt*12345789234567@localhost:9000/dlt?secure=1"
    ```
 
@@ -100,9 +99,10 @@ You can set the following configuration options in the `.dlt/secrets.toml` file:
 
 ```toml
 [destination.clickhouse]
-dataset_table_separator = "___"                         # The default separator for dataset table names from dataset.
+dataset_table_separator = "___"                         # The default separator for dataset table names from the dataset.
 table_engine_type = "merge_tree"                        # The default table engine to use.
 dataset_sentinel_table_name = "dlt_sentinel_table"      # The default name for sentinel tables.
+staging_use_https = true                                # Wether to connecto to the staging bucket via https (defaults to True)
 ```
 
 ## Write disposition
@@ -114,34 +114,37 @@ All [write dispositions](../../general-usage/incremental-loading#choosing-a-writ
 Data is loaded into ClickHouse using the most efficient method depending on the data source:
 
 - For local files, the `clickhouse-connect` library is used to directly load files into ClickHouse tables using the `INSERT` command.
-- For files in remote storage like S3, Google Cloud Storage, or Azure Blob Storage, ClickHouse table functions like `s3`, `gcs` and `azureBlobStorage` are used to read the files and insert the data
-  into tables.
+- For files in remote storage like S3, Google Cloud Storage, or Azure Blob Storage, ClickHouse table functions like `s3`, `gcs`, and `azureBlobStorage` are used to read the files and insert the data into tables.
 
 ## Datasets
 
-`Clickhouse` does not support multiple datasets in one database, dlt relies on datasets to exist for multiple reasons.
-To make `clickhouse` work with `dlt`, tables generated by `dlt` in your `clickhouse` database will have their name prefixed with the dataset name separated by
+ClickHouse does not support multiple datasets in one database; dlt relies on datasets to exist for multiple reasons.
+To make ClickHouse work with `dlt`, tables generated by `dlt` in your ClickHouse database will have their names prefixed with the dataset name, separated by
 the configurable `dataset_table_separator`.
 Additionally, a special sentinel table that doesn't contain any data will be created, so dlt knows which virtual datasets already exist in a
 clickhouse
 destination.
 
+:::tip
+`dataset_name` is optional for ClickHouse. When skipped `dlt` will create all tables without prefix. Note that staging dataset
+tables will still be prefixed with `_staging` (or other name that you configure).
+:::
+
 ## Supported file formats
 
-- [jsonl](../file-formats/jsonl.md) is the preferred format for both direct loading and staging.
-- [parquet](../file-formats/parquet.md) is supported for both direct loading and staging.
+- [JSONL](../file-formats/jsonl.md) is the preferred format for both direct loading and staging.
+- [Parquet](../file-formats/parquet.md) is supported for both direct loading and staging.
 
-The `clickhouse` destination has a few specific deviations from the default sql destinations:
+The `clickhouse` destination has a few specific deviations from the default SQL destinations:
 
-1. `Clickhouse` has an experimental `object` datatype, but we've found it to be a bit unpredictable, so the dlt clickhouse destination will load the complex datatype to a `text` column.
+1. ClickHouse has an experimental `object` datatype, but we've found it to be a bit unpredictable, so the dlt `clickhouse` destination will load the `json` datatype to a `text` column.
    If you need
    this feature, get in touch with our Slack community, and we will consider adding it.
-2. `Clickhouse` does not support the `time` datatype. Time will be loaded to a `text` column.
-3. `Clickhouse` does not support the `binary` datatype. Binary will be loaded to a `text` column. When loading from `jsonl`, this will be a base64 string, when loading from parquet this will be
+2. ClickHouse does not support the `time` datatype. Time will be loaded to a `text` column.
+3. ClickHouse does not support the `binary` datatype. Binary will be loaded to a `text` column. When loading from JSONL, this will be a base64 string; when loading from parquet, this will be
    the `binary` object converted to `text`.
-4. `Clickhouse` accepts adding columns to a populated table that aren’t null.
-5. `Clickhouse` can produce rounding errors under certain conditions when using the float / double datatype. Make sure to use decimal if you can’t afford to have rounding errors. Loading the value
-   12.7001 to a double column with the loader file format jsonl set will predictably produce a rounding error, for example.
+4. ClickHouse accepts adding columns to a populated table that aren’t null.
+5. ClickHouse can produce rounding errors under certain conditions when using the float/double datatype. Make sure to use decimal if you can’t afford to have rounding errors. Loading the value 12.7001 to a double column with the loader file format jsonl set will predictably produce a rounding error, for example.
 
 ## Supported column hints
 
@@ -149,9 +152,9 @@ ClickHouse supports the following [column hints](../../general-usage/schema#tabl
 
 - `primary_key` - marks the column as part of the primary key. Multiple columns can have this hint to create a composite primary key.
 
-## Choosing a Table Engine
+## Choosing a table engine
 
-dlt defaults to `MergeTree` table engine. You can specify an alternate table engine in two ways:
+dlt defaults to the `MergeTree` table engine. You can specify an alternate table engine in two ways:
 
 ### Setting a default table engine in the configuration
 
@@ -165,7 +168,7 @@ table_engine_type = "merge_tree"                        # The default table engi
 
 ### Setting the table engine for specific resources
 
-You can also set the table engine for specific resources using the clickhouse_adapter, which will override the default engine set in `.dlt/secrets.toml`, for that resource:
+You can also set the table engine for specific resources using the clickhouse_adapter, which will override the default engine set in `.dlt/secrets.toml` for that resource:
 
 ```py
 from dlt.destinations.adapters import clickhouse_adapter
@@ -180,7 +183,7 @@ clickhouse_adapter(my_resource, table_engine_type="merge_tree")
 Supported values for `table_engine_type` are:
 
 - `merge_tree` (default) - creates tables using the `MergeTree` engine, suitable for most use cases. [Learn more about MergeTree](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree).
-- `shared_merge_tree` - creates tables using the `SharedMergeTree` engine, optimized for cloud-native environments with shared storage. This table is **only** available on ClickHouse Cloud, and it the default selection if `merge_tree` is selected. [Learn more about SharedMergeTree](https://clickhouse.com/docs/en/cloud/reference/shared-merge-tree).
+- `shared_merge_tree` - creates tables using the `SharedMergeTree` engine, optimized for cloud-native environments with shared storage. This table is **only** available on ClickHouse Cloud, and it is the default selection if `merge_tree` is selected. [Learn more about SharedMergeTree](https://clickhouse.com/docs/en/cloud/reference/shared-merge-tree).
 - `replicated_merge_tree` - creates tables using the `ReplicatedMergeTree` engine, which supports data replication across multiple nodes for high availability. [Learn more about ReplicatedMergeTree](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/replication). This defaults to `shared_merge_tree` on ClickHouse Cloud.
 - Experimental support for the `Log` engine family with `stripe_log` and `tiny_log`.
 
@@ -209,7 +212,7 @@ pipeline = dlt.pipeline(
 )
 ```
 
-### Using Google Cloud or S3-Compatible Storage as a Staging Area
+### Using Google Cloud or S3-compatible storage as a staging area
 
 dlt supports using S3-compatible storage services, including Google Cloud Storage (GCS), as a staging area when loading data into ClickHouse.
 This is handled automatically by
@@ -220,14 +223,13 @@ To enable this, GCS provides an S3
 compatibility mode that emulates the S3 API, allowing ClickHouse to access GCS buckets via its S3 integration.
 
 For detailed instructions on setting up S3-compatible storage with dlt, including AWS S3, MinIO, and Cloudflare R2, refer to
-the [dlt documentation on filesystem destinations](https://dlthub.com/docs/dlt-ecosystem/destinations/filesystem#using-s3-compatible-storage).
+the [dlt documentation on filesystem destinations](../../dlt-ecosystem/destinations/filesystem#using-s3-compatible-storage).
 
 To set up GCS staging with HMAC authentication in dlt:
 
 1. Create HMAC keys for your GCS service account by following the [Google Cloud guide](https://cloud.google.com/storage/docs/authentication/managing-hmackeys#create).
 
-2. Configure the HMAC keys (`aws_access_key_id` and `aws_secret_access_key`) in your dlt project's ClickHouse destination settings in `config.toml`, similar to how you would configure AWS S3
-   credentials:
+2. Configure the HMAC keys (`aws_access_key_id` and `aws_secret_access_key`) as well as `endpoint_url` in your dlt project's ClickHouse destination settings in `config.toml`, similar to how you would configure AWS S3 credentials:
 
 ```toml
 [destination.filesystem]
@@ -255,3 +257,4 @@ Integration with [dbt](../transformations/dbt/dbt.md) is generally supported via
 This destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination).
 
 <!--@@@DLT_TUBA clickhouse-->
+

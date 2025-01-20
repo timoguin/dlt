@@ -1,4 +1,3 @@
-from .run_configuration import RunConfiguration
 from .base_configuration import (
     BaseConfiguration,
     CredentialsConfiguration,
@@ -28,6 +27,7 @@ from .azure_credentials import (
     AnyAzureCredentials,
 )
 
+from .sftp_crendentials import SFTPCredentials
 
 # backward compatibility for service account credentials
 from .gcp_credentials import (
@@ -35,8 +35,12 @@ from .gcp_credentials import (
     GcpServiceAccountCredentials as GcpClientCredentialsWithDefault,
 )
 
+from .pluggable_run_context import PluggableRunContext
+from .runtime_configuration import RuntimeConfiguration, RunConfiguration
+
 
 __all__ = [
+    "RuntimeConfiguration",
     "RunConfiguration",
     "BaseConfiguration",
     "CredentialsConfiguration",
@@ -45,6 +49,7 @@ __all__ = [
     "extract_inner_hint",
     "is_base_configuration_inner_hint",
     "configspec",
+    "PluggableRunContext",
     "ConfigSectionContext",
     "GcpServiceAccountCredentialsWithoutDefaults",
     "GcpServiceAccountCredentials",
@@ -62,4 +67,5 @@ __all__ = [
     "AnyAzureCredentials",
     "GcpClientCredentials",
     "GcpClientCredentialsWithDefault",
+    "SFTPCredentials",
 ]

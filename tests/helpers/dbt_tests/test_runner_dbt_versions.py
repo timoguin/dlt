@@ -45,11 +45,11 @@ def client() -> Iterator[PostgresClient]:
 PACKAGE_PARAMS = [
     ("postgres", "1.5.2"),
     ("postgres", "1.6.13"),
-    ("postgres", "1.8.1"),
+    ("postgres", "1.8.6"),
     ("postgres", None),
     ("snowflake", "1.5.2"),
     ("snowflake", "1.6.13"),
-    ("snowflake", "1.8.1"),
+    ("snowflake", "1.8.6"),
     ("snowflake", None),
 ]
 PACKAGE_IDS = [
@@ -79,10 +79,10 @@ def test_infer_venv_deps() -> None:
     # provide version ranges
     requirements = _create_dbt_deps(["duckdb"], dbt_version=">3")
     # special duckdb dependency
-    assert requirements[:-1] == ["dbt-core>3", "dbt-duckdb", "duckdb==0.10.3"]
+    assert requirements[:-1] == ["dbt-core>3", "dbt-duckdb", "duckdb==1.1.2"]
     # we do not validate version ranges, pip will do it and fail when creating venv
     requirements = _create_dbt_deps(["motherduck"], dbt_version="y")
-    assert requirements[:-1] == ["dbt-corey", "dbt-duckdb", "duckdb==0.10.3"]
+    assert requirements[:-1] == ["dbt-corey", "dbt-duckdb", "duckdb==1.1.2"]
 
 
 def test_default_profile_name() -> None:

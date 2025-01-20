@@ -24,11 +24,14 @@ Be it a Google Colab notebook, AWS Lambda function, an Airflow DAG, your local l
   <a target="_blank" href="https://pypi.org/project/dlt/" style="background:none">
     <img src="https://img.shields.io/pypi/pyversions/dlt?labelColor=191937&color=6F6FF7">
   </a>
+  <a target="_blank" href="https://pypi.org/project/dlt/" style="background:none">
+    <img src="https://img.shields.io/pypi/dm/dlt?labelColor=191937&color=6F6FF7">
+  </a>
 </div>
 
 ## Installation
 
-dlt supports Python 3.8+.
+dlt supports Python 3.9+. Python 3.13 is supported but considered experimental at this time as not all of dlts extras have python 3.13. support. We additionally maintain a [forked version of pendulum](https://github.com/dlt-hub/pendulum) for 3.13 until there is a release for 3.13.
 
 ```sh
 pip install dlt
@@ -94,15 +97,16 @@ You can find examples for various use cases in the [examples](docs/examples) fol
 
 ## Adding as dependency
 
-`dlt` follows the semantic versioning with the [`MAJOR.MINOR.PATCH`](https://peps.python.org/pep-0440/#semantic-versioning) pattern. Currently, we are using **pre-release versioning** with the major version being 0.
+`dlt` follows the semantic versioning with the [`MAJOR.MINOR.PATCH`](https://peps.python.org/pep-0440/#semantic-versioning) pattern.
 
-- `minor` version change means breaking changes
-- `patch` version change means new features that should be backward compatible
-- any suffix change, e.g., `post10` -> `post11`, is considered a patch
+* `major` means breaking changes and removed deprecations
+* `minor` new features, sometimes automatic migrations
+* `patch` bug fixes
 
 We suggest that you allow only `patch` level updates automatically:
-* Using the [Compatible Release Specifier](https://packaging.python.org/en/latest/specifications/version-specifiers/#compatible-release). For example **dlt~=0.3.10** allows only versions **>=0.3.10** and less than **<0.4**
-* Poetry [caret requirements](https://python-poetry.org/docs/dependency-specification/). For example **^0.3.10** allows only versions **>=0.3.10** to **<0.4**
+* Using the [Compatible Release Specifier](https://packaging.python.org/en/latest/specifications/version-specifiers/#compatible-release). For example **dlt~=1.0** allows only versions **>=1.0** and less than **<1.1**
+* Poetry [caret requirements](https://python-poetry.org/docs/dependency-specification/). For example **^1.0** allows only versions **>=1.0** to **<1.0**
+
 ## Get Involved
 
 The dlt project is quickly growing, and we're excited to have you join our community! Here's how you can get involved:

@@ -2,10 +2,11 @@ import re
 import abc
 import os
 import yaml
+import ast
+
 from yaml import Dumper
 from itertools import chain
 from typing import List, Optional, Sequence, Tuple, Any, Dict
-from astunparse import unparse
 
 # optional dependencies
 import pipdeptree
@@ -14,10 +15,14 @@ import cron_descriptor
 import dlt
 
 from dlt.common import git
-from dlt.common.configuration.exceptions import LookupTrace
-from dlt.common.configuration.providers import ConfigTomlProvider, EnvironProvider
+from dlt.common.configuration.exceptions import LookupTrace, ConfigFieldMissingException
+from dlt.common.configuration.providers import (
+    CONFIG_TOML,
+    EnvironProvider,
+    StringTomlProvider,
+)
 from dlt.common.git import get_origin, get_repo, Repo
-from dlt.common.configuration.specs.run_configuration import get_default_pipeline_name
+from dlt.common.configuration.specs.runtime_configuration import get_default_pipeline_name
 from dlt.common.typing import StrAny
 from dlt.common.reflection.utils import evaluate_node_literal
 from dlt.common.pipeline import LoadInfo, TPipelineState, get_dlt_repos_dir
@@ -31,7 +36,7 @@ from dlt.reflection.script_visitor import PipelineScriptVisitor
 
 from dlt.cli import utils
 from dlt.cli import echo as fmt
-from dlt.cli.exceptions import CliCommandException
+from dlt.cli.exceptions import CliCommandInnerException
 
 GITHUB_URL = "https://github.com/"
 
@@ -67,7 +72,6 @@ class BaseDeployment(abc.ABC):
         self.working_directory: str
         self.state: TPipelineState
 
-        self.config_prov = ConfigTomlProvider()
         self.env_prov = EnvironProvider()
         self.envs: List[LookupTrace] = []
         self.secret_envs: List[LookupTrace] = []
@@ -95,14 +99,14 @@ class BaseDeployment(abc.ABC):
         try:
             origin = get_origin(self.repo)
             if "github.com" not in origin:
-                raise CliCommandException(
+                raise CliCommandInnerException(
                     "deploy",
                     f"Your current repository origin is not set to github but to {origin}.\nYou"
                     " must change it to be able to run the pipelines with github actions:"
                     " https://docs.github.com/en/get-started/getting-started-with-git/managing-remote-repositories",
                 )
         except ValueError:
-            raise CliCommandException(
+            raise CliCommandInnerException(
                 "deploy",
                 "Your current repository has no origin set. Please set it up to be able to run the"
                 " pipelines with github actions:"
@@ -186,7 +190,7 @@ class BaseDeployment(abc.ABC):
                 # fmt.echo(f"{resolved_value.key}:{resolved_value.value}{type(resolved_value.value)} in {resolved_value.sections} is SECRET")
             else:
                 # move all config values that are not in config.toml into env
-                if resolved_value.provider_name != self.config_prov.name:
+                if resolved_value.provider_name != CONFIG_TOML:
                     self.envs.append(
                         LookupTrace(
                             self.env_prov.name,
@@ -198,12 +202,50 @@ class BaseDeployment(abc.ABC):
                     # fmt.echo(f"{resolved_value.key} in {resolved_value.sections} moved to CONFIG")
 
     def _echo_secrets(self) -> None:
+        display_info = False
         for s_v in self.secret_envs:
             fmt.secho("Name:", fg="green")
             fmt.echo(fmt.bold(self.env_prov.get_key_name(s_v.key, *s_v.sections)))
-            fmt.secho("Secret:", fg="green")
-            fmt.echo(s_v.value)
+            try:
+                fmt.secho("Secret:", fg="green")
+                fmt.echo(self._lookup_secret_value(s_v))
+            except ConfigFieldMissingException:
+                fmt.secho("please set me up!", fg="red")
+                display_info = True
             fmt.echo()
+        if display_info:
+            self._display_missing_secret_info()
+            fmt.echo()
+
+    def _echo_secrets_toml(self) -> None:
+        display_info = False
+        toml_provider = StringTomlProvider("")
+        for s_v in self.secret_envs:
+            try:
+                secret_value = self._lookup_secret_value(s_v)
+            except ConfigFieldMissingException:
+                secret_value = "please set me up!"
+                display_info = True
+            toml_provider.set_value(s_v.key, secret_value, None, *s_v.sections)
+        for s_v in self.envs:
+            toml_provider.set_value(s_v.key, s_v.value, None, *s_v.sections)
+        fmt.echo(toml_provider.dumps())
+        if display_info:
+            self._display_missing_secret_info()
+            fmt.echo()
+
+    def _display_missing_secret_info(self) -> None:
+        fmt.warning(
+            "We could not read and display some secrets. Starting from 1.0 version of dlt,"
+            " those are not stored in the traces. Instead we are trying to read them from the"
+            " available configuration ie. secrets.toml file. Please run the deploy command from"
+            " the same working directory you ran your pipeline script. If you pass the"
+            " credentials in code we will not be able to display them here. See"
+            " https://dlthub.com/docs/general-usage/credentials/"
+        )
+
+    def _lookup_secret_value(self, trace: LookupTrace) -> Any:
+        return dlt.secrets[StringTomlProvider.get_key_name(trace.key, *trace.sections)]
 
     def _echo_envs(self) -> None:
         for v in self.envs:
@@ -251,7 +293,7 @@ def get_state_and_trace(pipeline: Pipeline) -> Tuple[TPipelineState, PipelineTra
 def get_visitors(pipeline_script: str, pipeline_script_path: str) -> PipelineScriptVisitor:
     visitor = utils.parse_init_script("deploy", pipeline_script, pipeline_script_path)
     if n.RUN not in visitor.known_calls:
-        raise CliCommandException(
+        raise CliCommandInnerException(
             "deploy",
             f"The pipeline script {pipeline_script_path} does not seem to run the pipeline.",
         )
@@ -272,7 +314,7 @@ def parse_pipeline_info(visitor: PipelineScriptVisitor) -> List[Tuple[str, Optio
                 if f_r_value is None:
                     fmt.warning(
                         "The value of `dev_mode` in call to `dlt.pipeline` cannot be"
-                        f" determined from {unparse(f_r_node).strip()}. We assume that you know"
+                        f" determined from {ast.unparse(f_r_node).strip()}. We assume that you know"
                         " what you are doing :)"
                     )
                 if f_r_value is True:
@@ -281,28 +323,28 @@ def parse_pipeline_info(visitor: PipelineScriptVisitor) -> List[Tuple[str, Optio
                         " abort to set it to False?",
                         default=True,
                     ):
-                        raise CliCommandException("deploy", "Please set the dev_mode to False")
+                        raise CliCommandInnerException("deploy", "Please set the dev_mode to False")
 
             p_d_node = call_args.arguments.get("pipelines_dir")
             if p_d_node:
                 pipelines_dir = evaluate_node_literal(p_d_node)
                 if pipelines_dir is None:
-                    raise CliCommandException(
+                    raise CliCommandInnerException(
                         "deploy",
                         "The value of 'pipelines_dir' argument in call to `dlt_pipeline` cannot be"
-                        f" determined from {unparse(p_d_node).strip()}. Pipeline working dir will"
-                        " be found. Pass it directly with --pipelines-dir option.",
+                        f" determined from {ast.unparse(p_d_node).strip()}. Pipeline working dir"
+                        " will be found. Pass it directly with --pipelines-dir option.",
                     )
 
             p_n_node = call_args.arguments.get("pipeline_name")
             if p_n_node:
                 pipeline_name = evaluate_node_literal(p_n_node)
                 if pipeline_name is None:
-                    raise CliCommandException(
+                    raise CliCommandInnerException(
                         "deploy",
                         "The value of 'pipeline_name' argument in call to `dlt_pipeline` cannot be"
-                        f" determined from {unparse(p_d_node).strip()}. Pipeline working dir will"
-                        " be found. Pass it directly with --pipeline-name option.",
+                        f" determined from {ast.unparse(p_d_node).strip()}. Pipeline working dir"
+                        " will be found. Pass it directly with --pipeline-name option.",
                     )
             pipelines.append((pipeline_name, pipelines_dir))
 
@@ -397,9 +439,9 @@ def ask_files_overwrite(files: Sequence[str]) -> None:
     if existing:
         fmt.echo("Following files will be overwritten: %s" % fmt.bold(str(existing)))
         if not fmt.confirm("Do you want to continue?", default=False):
-            raise CliCommandException("init", "Aborted")
+            raise CliCommandInnerException("init", "Aborted")
 
 
-class PipelineWasNotRun(CliCommandException):
+class PipelineWasNotRun(CliCommandInnerException):
     def __init__(self, msg: str) -> None:
         super().__init__("deploy", msg, None)

@@ -8,7 +8,7 @@ from typing import Mapping, Tuple, cast, Any, Dict
 import datetime  # noqa: 251
 
 from dlt.common import json
-from dlt.common.typing import StrAny
+from dlt.common.typing import StrAny, TSecretStrValue
 from dlt.common.schema import utils, Schema
 from dlt.common.schema.typing import TTableSchemaColumns
 from dlt.common.configuration.providers import environ as environ_provider
@@ -17,13 +17,13 @@ from dlt.common.configuration.providers import environ as environ_provider
 COMMON_TEST_CASES_PATH = "./tests/common/cases/"
 
 
-def IMPORTED_VERSION_HASH_ETH_V9() -> str:
+def IMPORTED_VERSION_HASH_ETH_V10() -> str:
     # for import schema tests, change when upgrading the schema version
-    eth_V9 = load_yml_case("schemas/eth/ethereum_schema_v9")
-    assert eth_V9["version_hash"] == "PgEHvn5+BHV1jNzNYpx9aDpq6Pq1PSSetufj/h0hKg4="
+    eth_V11 = load_yml_case("schemas/eth/ethereum_schema_v11")
+    assert eth_V11["version_hash"] == "XfkJ8E1tZzG/Sb3lfEZrEVshTMKdB7JpOP2HA7eS6EI="
     # remove processing hints before installing as import schema
     # ethereum schema is a "dirty" schema with processing hints
-    eth = Schema.from_dict(eth_V9, remove_processing_hints=True)
+    eth = Schema.from_dict(eth_V11, remove_processing_hints=True)
     return eth.stored_version_hash
 
 
@@ -64,9 +64,7 @@ def restore_secret_storage_path() -> None:
 
 def load_secret(name: str) -> str:
     environ_provider.SECRET_STORAGE_PATH = "./tests/common/cases/secrets/%s"
-    secret, _ = environ_provider.EnvironProvider().get_value(
-        name, environ_provider.TSecretValue, None
-    )
+    secret, _ = environ_provider.EnvironProvider().get_value(name, TSecretStrValue, None)
     if not secret:
         raise FileNotFoundError(environ_provider.SECRET_STORAGE_PATH % name)
     return secret

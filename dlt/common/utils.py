@@ -24,6 +24,7 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    Type,
     TypeVar,
     Mapping,
     List,
@@ -41,6 +42,7 @@ from dlt.common.typing import AnyFun, StrAny, DictStrAny, StrStr, TAny, TFun
 
 
 T = TypeVar("T")
+TObj = TypeVar("TObj", bound=object)
 TDict = TypeVar("TDict", bound=MutableMapping[Any, Any])
 
 TKey = TypeVar("TKey")
@@ -271,7 +273,6 @@ def update_dict_nested(dst: TDict, src: TDict, copy_src_dicts: bool = False) -> 
             dst[key] = update_dict_nested({}, src_val, True)
         else:
             dst[key] = src_val
-
     return dst
 
 
@@ -282,29 +283,31 @@ def clone_dict_nested(src: TDict) -> TDict:
     return update_dict_nested({}, src, copy_src_dicts=True)  # type: ignore[return-value]
 
 
-def map_nested_in_place(func: AnyFun, _complex: TAny) -> TAny:
-    """Applies `func` to all elements in `_dict` recursively, replacing elements in nested dictionaries and lists in place."""
-    if isinstance(_complex, tuple):
-        if hasattr(_complex, "_asdict"):
-            _complex = _complex._asdict()
+def map_nested_in_place(func: AnyFun, _nested: TAny, *args: Any, **kwargs: Any) -> TAny:
+    """Applies `func` to all elements in `_dict` recursively, replacing elements in nested dictionaries and lists in place.
+    Additional `*args` and `**kwargs` are passed to `func`.
+    """
+    if isinstance(_nested, tuple):
+        if hasattr(_nested, "_asdict"):
+            _nested = _nested._asdict()
         else:
-            _complex = list(_complex)  # type: ignore
+            _nested = list(_nested)  # type: ignore
 
-    if isinstance(_complex, dict):
-        for k, v in _complex.items():
+    if isinstance(_nested, dict):
+        for k, v in _nested.items():
             if isinstance(v, (dict, list, tuple)):
-                _complex[k] = map_nested_in_place(func, v)
+                _nested[k] = map_nested_in_place(func, v, *args, **kwargs)
             else:
-                _complex[k] = func(v)
-    elif isinstance(_complex, list):
-        for idx, _l in enumerate(_complex):
+                _nested[k] = func(v, *args, **kwargs)
+    elif isinstance(_nested, list):
+        for idx, _l in enumerate(_nested):
             if isinstance(_l, (dict, list, tuple)):
-                _complex[idx] = map_nested_in_place(func, _l)
+                _nested[idx] = map_nested_in_place(func, _l, *args, **kwargs)
             else:
-                _complex[idx] = func(_l)
+                _nested[idx] = func(_l, *args, **kwargs)
     else:
-        raise ValueError(_complex, "Not a complex type")
-    return _complex
+        raise ValueError(_nested, "Not a nested type")
+    return _nested
 
 
 def is_interactive() -> bool:
@@ -503,6 +506,20 @@ def without_none(d: Mapping[TKey, Optional[TValue]]) -> Mapping[TKey, TValue]:
     return {k: v for k, v in d.items() if v is not None}
 
 
+def exclude_keys(mapping: Mapping[str, Any], keys: Iterable[str]) -> Dict[str, Any]:
+    """Create a new dictionary from the input mapping, excluding specified keys.
+
+    Args:
+        mapping (Mapping[str, Any]): The input mapping from which keys will be excluded.
+        keys (Iterable[str]): The keys to exclude.
+
+    Returns:
+        Dict[str, Any]: A new dictionary containing all key-value pairs from the original
+                        mapping except those with keys specified in `keys`.
+    """
+    return {k: v for k, v in mapping.items() if k not in keys}
+
+
 def get_full_class_name(obj: Any) -> str:
     cls = obj.__class__
     module = cls.__module__
@@ -566,6 +583,27 @@ def get_exception_trace_chain(
     return traces
 
 
+def group_dict_of_lists(input_dict: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
+    """Decomposes a dictionary with list values into a list of dictionaries with unique keys.
+
+    This function takes an input dictionary where each key maps to a list of objects.
+    It returns a list of dictionaries, each containing at most one object per key.
+    The goal is to ensure that no two objects with the same key appear in the same dictionary.
+
+    Parameters:
+        input_dict (Dict[str, List[Any]]): A dictionary with string keys and list of objects as values.
+
+    Returns:
+        List[Dict[str, Any]]: A list of dictionaries, each with unique keys and single objects.
+    """
+    max_length = max(len(v) for v in input_dict.values())
+    list_of_dicts: List[Dict[str, Any]] = [{} for _ in range(max_length)]
+    for name, value_list in input_dict.items():
+        for idx, obj in enumerate(value_list):
+            list_of_dicts[idx][name] = obj
+    return list_of_dicts
+
+
 def order_deduped(lst: List[Any]) -> List[Any]:
     """Returns deduplicated list preserving order of input elements.
 
@@ -583,3 +621,34 @@ def assert_min_pkg_version(pkg_name: str, version: str, msg: str = "") -> None:
             version_required=">=" + version,
             appendix=msg,
         )
+
+
+def make_defunct_class(cls: TObj) -> Type[TObj]:
+    class DefunctClass(cls.__class__):  # type: ignore[name-defined]
+        """A defunct class to replace __class__ when we want to destroy current instance"""
+
+        def __getattribute__(self, name: str) -> Any:
+            if name == "__class__":
+                # Allow access to __class__
+                return object.__getattribute__(self, name)
+            else:
+                raise RuntimeError("This instance has been dropped and cannot be used anymore.")
+
+    return DefunctClass
+
+
+def is_typeerror_due_to_wrong_call(exc: Exception, func: AnyFun) -> bool:
+    """
+    Determine if a TypeError is due to a wrong call to the function (incorrect arguments)
+    by inspecting the exception message.
+    """
+    if not isinstance(exc, TypeError):
+        return False
+    func_name = func.__name__
+    message = str(exc)
+    return message.__contains__(f"{func_name}()")
+
+
+removeprefix = getattr(
+    str, "removeprefix", lambda s_, p_: s_[len(p_) :] if s_.startswith(p_) else s_
+)

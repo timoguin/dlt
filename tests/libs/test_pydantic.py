@@ -24,6 +24,7 @@ from enum import Enum
 from datetime import datetime, date, time  # noqa: I251
 from dlt.common import Decimal
 from dlt.common import json
+from dlt.common.schema.typing import TColumnType
 
 from dlt.common.libs.pydantic import (
     DltConfig,
@@ -168,7 +169,7 @@ class User(BaseModel):
     final_location: Final[Annotated[Union[str, int], None]]  # type: ignore[misc]
     final_optional: Final[Annotated[Optional[str], None]]  # type: ignore[misc]
 
-    dlt_config: ClassVar[DltConfig] = {"skip_complex_types": True}
+    dlt_config: ClassVar[DltConfig] = {"skip_nested_types": True}
 
 
 USER_INSTANCE_DATA = dict(
@@ -229,18 +230,18 @@ def test_pydantic_model_to_columns(instance: bool) -> None:
     assert result["decimal_field"]["data_type"] == "decimal"
     assert result["double_field"]["data_type"] == "double"
     assert result["time_field"]["data_type"] == "time"
-    assert result["nested_field"]["data_type"] == "complex"
-    assert result["list_field"]["data_type"] == "complex"
+    assert result["nested_field"]["data_type"] == "json"
+    assert result["list_field"]["data_type"] == "json"
     assert result["union_field"]["data_type"] == "bigint"
     assert result["optional_field"]["data_type"] == "double"
     assert result["optional_field"]["nullable"] is True
-    assert result["blank_dict_field"]["data_type"] == "complex"
-    assert result["parametrized_dict_field"]["data_type"] == "complex"
+    assert result["blank_dict_field"]["data_type"] == "json"
+    assert result["parametrized_dict_field"]["data_type"] == "json"
     assert result["str_enum_field"]["data_type"] == "text"
     assert result["int_enum_field"]["data_type"] == "bigint"
     assert result["mixed_enum_int_field"]["data_type"] == "text"
     assert result["mixed_enum_str_field"]["data_type"] == "text"
-    assert result["json_field"]["data_type"] == "complex"
+    assert result["json_field"]["data_type"] == "json"
     assert result["url_field"]["data_type"] == "text"
 
     # Any type fields are excluded from schema
@@ -260,9 +261,9 @@ def test_pydantic_model_to_columns_annotated() -> None:
     assert schema_from_user_class["final_optional"]["nullable"] is True
 
 
-def test_pydantic_model_skip_complex_types() -> None:
+def test_pydantic_model_skip_nested_types() -> None:
     class SkipNestedModel(Model):
-        dlt_config: ClassVar[DltConfig] = {"skip_complex_types": True}
+        dlt_config: ClassVar[DltConfig] = {"skip_nested_types": True}
 
     result = pydantic_to_table_schema_columns(SkipNestedModel)
 
@@ -347,7 +348,7 @@ def test_nested_model_config_propagation() -> None:
     assert model_freeze.__fields__["address"].annotation.__name__ == "UserAddressExtraAllow"  # type: ignore[index]
     # annotated is preserved
     type_origin = get_origin(model_freeze.__fields__["address"].rebuild_annotation())  # type: ignore[index]
-    assert issubclass(type_origin, Annotated)  # type: ignore[arg-type]
+    assert type_origin is Annotated
     # UserAddress is converted to UserAddressAllow only once
     type_annotation = model_freeze.__fields__["address"].annotation  # type: ignore[index]
     assert type_annotation is get_args(model_freeze.__fields__["unity"].annotation)[0]  # type: ignore[index]
@@ -393,7 +394,7 @@ def test_nested_model_config_propagation_optional_with_pipe():
         final_location: Final[Annotated[Union[str, int], None]]  # type: ignore[misc, syntax, unused-ignore]
         final_optional: Final[Annotated[str | None, None]]  # type: ignore[misc, syntax, unused-ignore]
 
-        dlt_config: ClassVar[DltConfig] = {"skip_complex_types": True}
+        dlt_config: ClassVar[DltConfig] = {"skip_nested_types": True}
 
     # TODO: move to separate test
     model_freeze = apply_schema_contract_to_model(UserPipe, "evolve", "freeze")
@@ -404,7 +405,7 @@ def test_nested_model_config_propagation_optional_with_pipe():
     assert model_freeze.__fields__["address"].annotation.__name__ == "UserAddressPipeExtraAllow"  # type: ignore[index]
     # annotated is preserved
     type_origin = get_origin(model_freeze.__fields__["address"].rebuild_annotation())  # type: ignore[index]
-    assert issubclass(type_origin, Annotated)  # type: ignore[arg-type]
+    assert type_origin is Annotated
     # UserAddress is converted to UserAddressAllow only once
     type_annotation = model_freeze.__fields__["address"].annotation  # type: ignore[index]
     assert type_annotation is get_args(model_freeze.__fields__["unity"].annotation)[0]  # type: ignore[index]
@@ -426,7 +427,7 @@ def test_item_list_validation() -> None:
     class ItemModel(BaseModel):
         b: bool
         opt: Optional[int] = None
-        dlt_config: ClassVar[DltConfig] = {"skip_complex_types": False}
+        dlt_config: ClassVar[DltConfig] = {"skip_nested_types": False}
 
     # non validating items removed from the list (both extra and declared)
     discard_model = apply_schema_contract_to_model(ItemModel, "discard_row", "discard_row")
@@ -563,7 +564,7 @@ def test_item_list_validation() -> None:
 def test_item_validation() -> None:
     class ItemModel(BaseModel):
         b: bool
-        dlt_config: ClassVar[DltConfig] = {"skip_complex_types": False}
+        dlt_config: ClassVar[DltConfig] = {"skip_nested_types": False}
 
     # non validating items removed from the list (both extra and declared)
     discard_model = apply_schema_contract_to_model(ItemModel, "discard_row", "discard_row")
@@ -648,9 +649,10 @@ class Parent(BaseModel):
     optional_parent_attribute: Optional[str] = None
 
 
-def test_pydantic_model_flattened_when_skip_complex_types_is_true():
+@pytest.mark.parametrize("config_attr", ("skip_nested_types", "skip_complex_types"))
+def test_pydantic_model_flattened_when_skip_nested_types_is_true(config_attr: str):
     class MyParent(Parent):
-        dlt_config: ClassVar[DltConfig] = {"skip_complex_types": True}
+        dlt_config: ClassVar[DltConfig] = {config_attr: True}  # type: ignore
 
     schema = pydantic_to_table_schema_columns(MyParent)
 
@@ -673,16 +675,17 @@ def test_pydantic_model_flattened_when_skip_complex_types_is_true():
     }
 
 
-def test_considers_model_as_complex_when_skip_complex_types_is_false():
+@pytest.mark.parametrize("config_attr", ("skip_nested_types", "skip_complex_types"))
+def test_considers_model_as_complex_when_skip_nested_types_is_false(config_attr: str):
     class MyParent(Parent):
         data_dictionary: Dict[str, Any] = None
-        dlt_config: ClassVar[DltConfig] = {"skip_complex_types": False}
+        dlt_config: ClassVar[DltConfig] = {config_attr: False}  # type: ignore
 
     schema = pydantic_to_table_schema_columns(MyParent)
 
     assert schema == {
-        "child": {"data_type": "complex", "name": "child", "nullable": False},
-        "data_dictionary": {"data_type": "complex", "name": "data_dictionary", "nullable": False},
+        "child": {"data_type": "json", "name": "child", "nullable": False},
+        "data_dictionary": {"data_type": "json", "name": "data_dictionary", "nullable": False},
         "optional_parent_attribute": {
             "data_type": "text",
             "name": "optional_parent_attribute",
@@ -691,34 +694,52 @@ def test_considers_model_as_complex_when_skip_complex_types_is_false():
     }
 
 
-def test_considers_dictionary_as_complex_when_skip_complex_types_is_false():
+def test_considers_dictionary_as_complex_when_skip_nested_types_is_false():
     class MyParent(Parent):
         data_list: List[str] = []
         data_dictionary: Dict[str, Any] = None
-        dlt_config: ClassVar[DltConfig] = {"skip_complex_types": False}
+        dlt_config: ClassVar[DltConfig] = {"skip_nested_types": False}
 
     schema = pydantic_to_table_schema_columns(MyParent)
 
     assert schema["data_dictionary"] == {
-        "data_type": "complex",
+        "data_type": "json",
         "name": "data_dictionary",
         "nullable": False,
     }
 
     assert schema["data_list"] == {
-        "data_type": "complex",
+        "data_type": "json",
         "name": "data_list",
         "nullable": False,
     }
 
 
-def test_skip_complex_types_when_skip_complex_types_is_true_and_field_is_not_pydantic_model():
+def test_skip_json_types_when_skip_nested_types_is_true_and_field_is_not_pydantic_model():
     class MyParent(Parent):
         data_list: List[str] = []
         data_dictionary: Dict[str, Any] = None
-        dlt_config: ClassVar[DltConfig] = {"skip_complex_types": True}
+        dlt_config: ClassVar[DltConfig] = {"skip_nested_types": True}
 
     schema = pydantic_to_table_schema_columns(MyParent)
 
     assert "data_dictionary" not in schema
     assert "data_list" not in schema
+
+
+def test_typed_dict_by_python_version():
+    """when using typeddict in pydantic, it should be imported
+    from typing_extensions in python 3.11 and earlier and typing
+    in python 3.12 and later.
+    Here we test that this is properly set up in dlt.
+    """
+
+    class MyModel(BaseModel):
+        # TColumnType inherits from TypedDict
+        column_type: TColumnType
+
+    m = MyModel(column_type={"data_type": "text"})
+    assert m.column_type == {"data_type": "text"}
+
+    with pytest.raises(ValidationError):
+        m = MyModel(column_type={"data_type": "invalid_type"})  # type: ignore[typeddict-item]
